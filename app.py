@@ -2,304 +2,209 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-from datetime import date
 
 st.set_page_config(page_title="ASX Share Analyser", page_icon="📈", layout="wide")
-
 st.title("📈 ASX Share Analyser")
-st.caption("Free research prototype · Australian shares · Data supplied by Yahoo Finance via yfinance")
+st.caption("Personal research prototype for Australian shares")
+st.warning("Not financial advice. Free data can be incomplete, delayed or incorrect. Verify figures against company reports and ASX announcements. This is not an official QAV product.")
 
-st.warning(
-    "Research tool only, not personal financial advice. Market data may be delayed, incomplete, or incorrect. "
-    "Always verify important figures against company reports and official ASX announcements."
-)
+with st.sidebar:
+    raw = st.text_input("ASX ticker", "BHP")
+    period = st.selectbox("Price history", ["1y", "2y", "5y", "10y"], index=2)
+    if st.button("Refresh data"):
+        st.cache_data.clear()
 
-def asx_symbol(raw):
-    symbol = raw.strip().upper()
-    if not symbol:
-        return ""
-    if "." not in symbol:
-        symbol += ".AX"
-    return symbol
-
-def safe_float(value):
-    try:
-        if value is None or pd.isna(value):
-            return None
-        return float(value)
-    except Exception:
-        return None
-
-def fmt_num(value, style="number"):
-    value = safe_float(value)
-    if value is None:
-        return "N/A"
-    if style == "money":
-        return f"${value:,.2f}"
-    if style == "percent":
-        return f"{value * 100:.1f}%"
-    if style == "large":
-        sign = "-" if value < 0 else ""
-        v = abs(value)
-        if v >= 1e12:
-            return f"{sign}${v/1e12:.2f}T"
-        if v >= 1e9:
-            return f"{sign}${v/1e9:.2f}B"
-        if v >= 1e6:
-            return f"{sign}${v/1e6:.2f}M"
-        return f"{sign}${v:,.0f}"
-    return f"{value:,.2f}"
+ticker = raw.strip().upper()
+if ticker and "." not in ticker:
+    ticker += ".AX"
+if not ticker:
+    st.info("Enter an ASX ticker.")
+    st.stop()
 
 @st.cache_data(ttl=900, show_spinner=False)
-def load_data(symbol, period):
-    ticker = yf.Ticker(symbol)
-    hist = ticker.history(period=period, auto_adjust=True)
-    try:
-        info = ticker.info or {}
-    except Exception:
-        info = {}
-    try:
-        financials = ticker.financials
-    except Exception:
-        financials = pd.DataFrame()
-    try:
-        balance = ticker.balance_sheet
-    except Exception:
-        balance = pd.DataFrame()
-    try:
-        cashflow = ticker.cashflow
-    except Exception:
-        cashflow = pd.DataFrame()
-    return hist, info, financials, balance, cashflow
+def load(symbol, period):
+    t = yf.Ticker(symbol)
+    h = t.history(period=period, auto_adjust=True)
+    try: info = t.info or {}
+    except Exception: info = {}
+    try: income = t.financials
+    except Exception: income = pd.DataFrame()
+    try: balance = t.balance_sheet
+    except Exception: balance = pd.DataFrame()
+    try: cash = t.cashflow
+    except Exception: cash = pd.DataFrame()
+    return h, info, income, balance, cash
 
-def latest_statement_value(frame, possible_names):
-    if frame is None or frame.empty:
+def number(x):
+    try:
+        return None if x is None or pd.isna(x) else float(x)
+    except Exception:
         return None
-    for name in possible_names:
+
+def fmt(x, kind="num"):
+    x = number(x)
+    if x is None: return "N/A"
+    if kind == "money": return f"${x:,.3f}"
+    if kind == "pct": return f"{x*100:.2f}%"
+    if kind == "large":
+        if abs(x) >= 1e9: return f"${x/1e9:.2f}B"
+        if abs(x) >= 1e6: return f"${x/1e6:.2f}M"
+    return f"{x:,.3f}"
+
+def stmt(frame, names):
+    if frame is None or frame.empty: return None
+    for name in names:
         if name in frame.index:
             vals = frame.loc[name].dropna()
-            if len(vals):
-                return safe_float(vals.iloc[0])
+            if len(vals): return number(vals.iloc[0])
     return None
 
-def score_metric(value, good, bad, higher_is_better=True):
-    if value is None or not np.isfinite(value):
-        return None
-    if higher_is_better:
-        if value >= good: return 100
-        if value <= bad: return 0
-        return 100 * (value - bad) / (good - bad)
-    else:
-        if value <= good: return 100
-        if value >= bad: return 0
-        return 100 * (bad - value) / (bad - good)
+try:
+    with st.spinner(f"Loading {ticker}..."):
+        hist, info, income, balance, cash = load(ticker, period)
+except Exception as e:
+    st.error("Could not retrieve data. Check the ticker or try again later.")
+    st.caption(str(e))
+    st.stop()
 
-def main():
-    with st.sidebar:
-        st.header("Analysis settings")
-        raw_symbol = st.text_input("ASX ticker", value="BHP", help="Enter BHP or BHP.AX")
-        period = st.selectbox("Price history", ["6mo", "1y", "2y", "5y", "10y"], index=2)
-        st.caption("For ASX-listed shares, the app adds .AX automatically.")
-        st.divider()
-        st.markdown("**Example tickers**")
-        st.write("BHP · CBA · CSL · WES · WOW · FMG · TLS · LKE")
-        refresh = st.button("Refresh data")
-        if refresh:
-            st.cache_data.clear()
+if hist is None or hist.empty:
+    st.error("No price history returned. Check the ticker or try another company.")
+    st.stop()
 
-    symbol = asx_symbol(raw_symbol)
-    if not symbol:
-        st.info("Enter an ASX ticker in the sidebar to begin.")
-        return
+close = hist["Close"].dropna()
+price = number(close.iloc[-1]) if len(close) else None
+prev = number(close.iloc[-2]) if len(close) > 1 else None
+change = price / prev - 1 if price is not None and prev not in (None, 0) else None
+name = info.get("longName") or info.get("shortName") or ticker
 
-    try:
-        with st.spinner(f"Loading {symbol} data..."):
-            hist, info, financials, balance, cashflow = load_data(symbol, period)
-    except Exception as e:
-        st.error("Could not load data right now. Check the ticker and try again.")
-        st.caption(f"Technical detail: {e}")
-        return
+st.subheader(f"{name} ({ticker})")
+a,b,c,d = st.columns(4)
+a.metric("Latest available close", fmt(price, "money"), fmt(change, "pct") if change is not None else None)
+b.metric("Market capitalisation", fmt(info.get("marketCap"), "large"))
+c.metric("Sector", info.get("sector") or "N/A")
+d.metric("Currency", info.get("currency") or "N/A")
 
-    if hist is None or hist.empty:
-        st.error(f"No price history was returned for {symbol}. Check the ticker; some ASX symbols may not be covered.")
-        return
+ocf = stmt(cash, ["Operating Cash Flow", "Total Cash From Operating Activities", "Cash Flow From Continuing Operating Activities"])
+shares = number(info.get("sharesOutstanding")) or number(info.get("impliedSharesOutstanding"))
+cash_ps = ocf / shares if ocf is not None and shares and shares > 0 else None
+price_cash = price / cash_ps if price is not None and cash_ps not in (None, 0) else None
+yield_raw = number(info.get("dividendYield"))
+yield_pct = yield_raw * 100 if yield_raw is not None else None
+pe = number(info.get("trailingPE"))
+equity = stmt(balance, ["Stockholders Equity", "Total Stockholder Equity", "Total Equity Gross Minority Interest"])
+equity_ps = equity / shares if equity is not None and shares and shares > 0 else None
+eps_auto = number(info.get("trailingEps"))
+forward_eps_auto = number(info.get("forwardEps"))
 
-    company = info.get("longName") or info.get("shortName") or symbol
-    latest_price = safe_float(hist["Close"].dropna().iloc[-1]) if hist["Close"].dropna().size else None
-    prev_price = safe_float(hist["Close"].dropna().iloc[-2]) if hist["Close"].dropna().size > 1 else None
-    day_change = (latest_price / prev_price - 1) if latest_price and prev_price else None
-    first_price = safe_float(hist["Close"].dropna().iloc[0]) if hist["Close"].dropna().size else None
-    period_change = (latest_price / first_price - 1) if latest_price and first_price else None
-
-    st.subheader(company)
-    st.caption(f"{symbol} · Sector: {info.get('sector', 'Not available')} · Industry: {info.get('industry', 'Not available')}")
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Latest close", fmt_num(latest_price, "money"), fmt_num(day_change, "percent") if day_change is not None else None)
-    m2.metric(f"Return over {period}", fmt_num(period_change, "percent"))
-    m3.metric("Market cap", fmt_num(info.get("marketCap"), "large"))
-    m4.metric("Currency", info.get("currency", "N/A"))
-
-    tab1, tab2, tab3, tab4 = st.tabs(["Overview & chart", "Fundamentals", "Technical signals", "Scorecard"])
-
-    with tab1:
-        st.markdown("### Price history")
-        chart_df = hist[["Close"]].copy()
-        chart_df["50-day average"] = chart_df["Close"].rolling(50).mean()
-        chart_df["200-day average"] = chart_df["Close"].rolling(200).mean()
-        st.line_chart(chart_df, use_container_width=True)
-        st.caption("Prices are adjusted historical prices where supplied by the data source; this is not a live trading feed.")
-        st.markdown("### Company overview")
-        st.write(info.get("longBusinessSummary", "No company description is available from the data source."))
-        st.markdown("### Recent price data")
-        st.dataframe(hist.tail(10).sort_index(ascending=False), use_container_width=True)
-
-    with tab2:
-        st.markdown("### Valuation and financial metrics")
-        metrics = [
-            ("Trailing P/E", info.get("trailingPE"), "number"),
-            ("Forward P/E", info.get("forwardPE"), "number"),
-            ("Price / book", info.get("priceToBook"), "number"),
-            ("Price / sales", info.get("priceToSalesTrailing12Months"), "number"),
-            ("Revenue growth", info.get("revenueGrowth"), "percent"),
-            ("Earnings growth", info.get("earningsGrowth"), "percent"),
-            ("Profit margin", info.get("profitMargins"), "percent"),
-            ("Operating margin", info.get("operatingMargins"), "percent"),
-            ("Return on equity", info.get("returnOnEquity"), "percent"),
-            ("Debt / equity", info.get("debtToEquity"), "number"),
-            ("Free cash flow", info.get("freeCashflow"), "large"),
-            ("Dividend yield", info.get("dividendYield"), "percent"),
-            ("52-week high", info.get("fiftyTwoWeekHigh"), "money"),
-            ("52-week low", info.get("fiftyTwoWeekLow"), "money"),
-        ]
-        rows = [{"Metric": name, "Value": fmt_num(val, style)} for name, val, style in metrics]
-        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
-        st.caption("N/A means the data source did not provide that metric. Check the company's annual/half-year reports before relying on a figure.")
-
-        st.markdown("### Latest available statement figures")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.markdown("**Income statement**")
-            if financials is not None and not financials.empty:
-                st.dataframe(financials.iloc[:, :4], use_container_width=True)
-            else:
-                st.info("Statement data unavailable.")
-        with col2:
-            st.markdown("**Balance sheet**")
-            if balance is not None and not balance.empty:
-                st.dataframe(balance.iloc[:, :4], use_container_width=True)
-            else:
-                st.info("Statement data unavailable.")
-        with col3:
-            st.markdown("**Cash flow**")
-            if cashflow is not None and not cashflow.empty:
-                st.dataframe(cashflow.iloc[:, :4], use_container_width=True)
-            else:
-                st.info("Statement data unavailable.")
-
-    close = hist["Close"].dropna()
-    sma50 = close.rolling(50).mean()
-    sma200 = close.rolling(200).mean()
+price_tab, inputs_tab, score_tab, data_tab = st.tabs(["Price & technicals", "Checklist inputs", "Rule scorecard", "Raw data"])
+with price_tab:
+    chart = hist[["Close"]].copy()
+    chart["50-day average"] = chart["Close"].rolling(50).mean()
+    chart["200-day average"] = chart["Close"].rolling(200).mean()
+    st.line_chart(chart, use_container_width=True)
     delta = close.diff()
     gain = delta.clip(lower=0).rolling(14).mean()
     loss = (-delta.clip(upper=0)).rolling(14).mean()
-    rs = gain / loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    latest_rsi = safe_float(rsi.iloc[-1]) if len(rsi) else None
-    latest_sma50 = safe_float(sma50.iloc[-1]) if len(sma50) else None
-    latest_sma200 = safe_float(sma200.iloc[-1]) if len(sma200) else None
-    macd_fast = close.ewm(span=12, adjust=False).mean()
-    macd_slow = close.ewm(span=26, adjust=False).mean()
-    macd = macd_fast - macd_slow
+    rsi = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
+    macd = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
     signal = macd.ewm(span=9, adjust=False).mean()
-    latest_macd_diff = safe_float((macd - signal).iloc[-1])
+    x,y,z,w = st.columns(4)
+    x.metric("RSI (14)", fmt(rsi.iloc[-1] if len(rsi) else None))
+    y.metric("50-day average", fmt(chart["50-day average"].iloc[-1], "money"))
+    z.metric("200-day average", fmt(chart["200-day average"].iloc[-1], "money"))
+    w.metric("MACD vs signal", "Positive" if len(macd) and macd.iloc[-1] > signal.iloc[-1] else "Negative")
+    st.info("3-point trend-line (3PTL) sentiment must be assessed manually in this version; the app does not draw or validate 3PTL lines.")
 
-    with tab3:
-        st.markdown("### Technical indicators")
-        t1, t2, t3 = st.columns(3)
-        t1.metric("RSI (14)", fmt_num(latest_rsi))
-        t2.metric("50-day average", fmt_num(latest_sma50, "money"))
-        t3.metric("200-day average", fmt_num(latest_sma200, "money"))
-        signals = []
-        if latest_price is not None and latest_sma50 is not None:
-            signals.append(("Price vs 50-day average", "Above" if latest_price > latest_sma50 else "Below"))
-        else:
-            signals.append(("Price vs 50-day average", "Insufficient history"))
-        if latest_sma50 is not None and latest_sma200 is not None:
-            signals.append(("50-day vs 200-day average", "50-day above 200-day" if latest_sma50 > latest_sma200 else "50-day below 200-day"))
-        else:
-            signals.append(("Moving-average trend", "Insufficient history"))
-        if latest_rsi is not None:
-            rsi_text = "Potentially overbought (>70)" if latest_rsi > 70 else ("Potentially oversold (<30)" if latest_rsi < 30 else "Between 30 and 70")
-        else:
-            rsi_text = "Insufficient history"
-        signals.append(("RSI interpretation", rsi_text))
-        if latest_macd_diff is not None:
-            signals.append(("MACD momentum", "MACD above signal" if latest_macd_diff > 0 else "MACD below signal"))
-        else:
-            signals.append(("MACD momentum", "Insufficient history"))
-        st.dataframe(pd.DataFrame(signals, columns=["Indicator", "Current reading"]), hide_index=True, use_container_width=True)
-        st.caption("Technical indicators describe past price behaviour. They do not reliably predict future prices.")
+with inputs_tab:
+    st.markdown("### Available automatic data")
+    auto = [
+        ("Operating cash flow", fmt(ocf, "large")), ("Shares outstanding", fmt(shares)),
+        ("Operating cash flow per share", fmt(cash_ps, "money")), ("Price / cash ratio", fmt(price_cash)),
+        ("Dividend yield", fmt(yield_raw, "pct")), ("Trailing P/E", fmt(pe)),
+        ("Total equity", fmt(equity, "large")), ("Equity per share", fmt(equity_ps, "money")),
+        ("Trailing EPS", fmt(eps_auto, "money")), ("Forward EPS estimate", fmt(forward_eps_auto, "money"))
+    ]
+    st.dataframe(pd.DataFrame(auto, columns=["Metric", "Value"]), hide_index=True, use_container_width=True)
+    st.markdown("### Manual checklist inputs")
+    st.caption("Use current company reports or a reliable provider. Leave unverified items unassessed.")
+    l,r = st.columns(2)
+    with l:
+        sentiment = st.selectbox("3PTL sentiment", ["Not assessed", "Positive / above buy line", "Negative / sell line breached", "Wait / needs uptick"])
+        upturn = st.selectbox("Positive upturn since latest financial report?", ["Not assessed", "Yes", "No"])
+        mortgage = st.number_input("Mortgage reference rate (%)", 0.0, 30.0, 6.0, 0.25)
+        hist_pe = st.selectbox("P/E vs last 3 years / 6 half-year periods", ["Not assessed", "Lowest", "Neither / unknown", "Highest", "Unprofitable / unavailable"])
+        equity_trend = st.selectbox("Equity trend", ["Not assessed", "Consistently increasing", "Not consistently increasing", "Insufficient history"])
+        audit = st.selectbox("Latest audit opinion", ["Not checked", "Clean / unmodified", "Qualified / adverse / disclaimer", "Emphasis of matter / going concern concern", "Other / unclear"])
+        founder = st.selectbox("Founder/board member owns at least 10%?", ["Not assessed", "Yes", "No"])
+    with r:
+        eps = st.number_input("Current EPS (override if needed)", value=float(eps_auto or 0), step=0.01, format="%.4f")
+        future_eps = st.number_input("Future EPS estimate (0 if unknown)", value=float(forward_eps_auto or 0), step=0.01, format="%.4f")
+        hurdle = st.number_input("Market hurdle rate (%)", 0.1, 50.0, 6.1, 0.1)
+        star = st.selectbox("Verified external Star Stock score", ["Not assessed", "0", "0.5", "1", "1.5", "2"])
+        external_iv = st.number_input("External intrinsic value per share (0 if unknown)", min_value=0.0, value=0.0, step=0.1)
+        health_trend = st.selectbox("Verified financial-health trend", ["Not assessed", "Increasing", "Stable", "Deteriorating", "Other / unclear"])
+        health_rating = st.selectbox("Verified financial-health rating", ["Not assessed", "Strong", "Satisfactory", "Other / weak"])
+        commodity = st.selectbox("Relevant commodity in 3PTL sell? (if applicable)", ["Not assessed / not applicable", "Yes", "No"])
 
-    with tab4:
-        st.markdown("### Transparent research score")
-        st.write("Scores are rough screening signals, not recommendations. Missing values are excluded rather than treated as good or bad.")
-        rev_growth = safe_float(info.get("revenueGrowth"))
-        earnings_growth = safe_float(info.get("earningsGrowth"))
-        margin = safe_float(info.get("profitMargins"))
-        roe = safe_float(info.get("returnOnEquity"))
-        pe = safe_float(info.get("trailingPE"))
-        debt_equity = safe_float(info.get("debtToEquity"))
+with score_tab:
+    rows = []
+    def add(rule, result, score=None, notes=""):
+        rows.append({"Rule": rule, "Result": result, "Score": score if score is not None else "—", "Notes": notes})
+    add("3PTL sentiment gate", sentiment, 1 if sentiment == "Positive / above buy line" else (0 if sentiment == "Negative / sell line breached" else None), "Manual chart assessment")
+    add("Positive upturn since latest report", upturn, 1 if upturn == "Yes" else (0 if upturn == "No" else None))
+    add("Operating cash flow positive", "Positive" if ocf is not None and ocf > 0 else ("Non-positive" if ocf is not None else "Missing"), None, fmt(ocf, "large"))
+    add("Price / cash ratio below 7", "Pass" if price_cash is not None and 0 < price_cash < 7 else ("Fail" if price_cash is not None else "Missing"), 2 if price_cash is not None and 0 < price_cash < 7 else (0 if price_cash is not None else None))
+    add("Dividend yield above mortgage rate", "Pass" if yield_pct is not None and yield_pct > mortgage else ("Fail" if yield_pct is not None else "Missing"), 1 if yield_pct is not None and yield_pct > mortgage else (0 if yield_pct is not None else None))
+    add("P/E below dividend yield", "Pass" if pe is not None and yield_pct is not None and pe < yield_pct else ("Fail" if pe is not None and yield_pct is not None else "Missing"), 1 if pe is not None and yield_pct is not None and pe < yield_pct else (0 if pe is not None and yield_pct is not None else None))
+    add("P/E lowest in historical period", hist_pe, {"Lowest": 2, "Highest": -1, "Unprofitable / unavailable": 0}.get(hist_pe), "Manual historical check")
+    add("Equity consistently increasing", equity_trend, 1 if equity_trend == "Consistently increasing" else (0 if equity_trend == "Not consistently increasing" else None))
+    add("Price below equity per share", "Pass" if price is not None and equity_ps is not None and price < equity_ps else ("Fail" if price is not None and equity_ps is not None else "Missing"), 1 if price is not None and equity_ps is not None and price < equity_ps else (0 if price is not None and equity_ps is not None else None))
+    add("Price <= 1.3 x equity per share", "Pass" if price is not None and equity_ps is not None and price <= 1.3*equity_ps else ("Fail" if price is not None and equity_ps is not None else "Missing"), 1 if price is not None and equity_ps is not None and price <= 1.3*equity_ps else (0 if price is not None and equity_ps is not None and price <= 1.3*equity_ps else None))
+    growth_pe = ((future_eps-eps)/eps)/pe if eps > 0 and future_eps > 0 and pe is not None and pe > 0 else None
+    growth_score = 2 if growth_pe is not None and growth_pe > 1.5 else (-1 if growth_pe is not None and growth_pe < 0 else (0 if growth_pe is not None else None))
+    add("EPS growth / P-E ratio", fmt(growth_pe), growth_score, "Estimate-based; verify inputs")
+    iv1 = eps/0.195 if eps > 0 else None
+    iv2 = future_eps/(hurdle/100) if future_eps > 0 and hurdle > 0 else None
+    add("Intrinsic value #1: current EPS / 19.5%", fmt(iv1, "money"))
+    add("Price below intrinsic value #1", "Pass" if price is not None and iv1 is not None and price < iv1 else ("Fail" if price is not None and iv1 is not None else "Missing"), 1 if price is not None and iv1 is not None and price < iv1 else (0 if price is not None and iv1 is not None else None))
+    add(f"Intrinsic value #2: future EPS / {hurdle:.1f}%", fmt(iv2, "money"), notes="Check hurdle rate against a current authoritative source")
+    add("Price below intrinsic value #2", "Pass" if price is not None and iv2 is not None and price < iv2 else ("Fail" if price is not None and iv2 is not None else "Missing"), 1 if price is not None and iv2 is not None and price < iv2 else (0 if price is not None and iv2 is not None and price < iv2 else None))
+    add("Intrinsic value #2 > 2 x share price", "Pass" if price is not None and iv2 is not None and iv2 > 2*price else ("Fail" if price is not None and iv2 is not None else "Missing"), 1 if price is not None and iv2 is not None and iv2 > 2*price else (0 if price is not None and iv2 is not None else None))
+    add("External Star Stock score", star, float(star) if star != "Not assessed" else None, "Manual verified input")
+    add("Price below external intrinsic value", "Pass" if external_iv > 0 and price is not None and price < external_iv else ("Fail" if external_iv > 0 and price is not None else "Not assessed"), 1 if external_iv > 0 and price is not None and price < external_iv else (0 if external_iv > 0 and price is not None else None))
+    add("External financial-health trend", health_trend, {"Increasing": 2, "Stable": 1, "Deteriorating": -1}.get(health_trend))
+    add("External financial-health rating", health_rating, 1 if health_rating in ["Strong", "Satisfactory"] else (0 if health_rating == "Other / weak" else None))
+    add("Founder/board ownership >= 10%", founder, 2 if founder == "Yes" else (0 if founder == "No" else None))
+    audit_result = {"Not checked":"Not checked", "Clean / unmodified":"No warning recorded", "Qualified / adverse / disclaimer":"FAIL — review carefully", "Emphasis of matter / going concern concern":"WARNING — manual review", "Other / unclear":"Manual review required"}[audit]
+    add("Audit opinion", audit_result, notes="Read the latest audit report")
+    add("Commodity trend", commodity, notes="Manual check where relevant")
+    df = pd.DataFrame(rows)
+    st.dataframe(df, hide_index=True, use_container_width=True)
+    scores = [float(v) for v in df["Score"] if isinstance(v, (int, float, np.integer, np.floating)) and not pd.isna(v)]
+    if scores:
+        m1, m2 = st.columns(2)
+        m1.metric("Sum of assessed points", f"{sum(scores):.1f}")
+        m2.metric("Number of scored rules", len(scores))
+    if sentiment == "Negative / sell line breached":
+        st.error("Sentiment gate failed. Treat this as a screening flag, not an automatic trade.")
+    elif sentiment == "Wait / needs uptick":
+        st.warning("Wait state: verify an uptick before treating sentiment as positive.")
+    if audit == "Qualified / adverse / disclaimer":
+        st.error("Audit warning selected. Read the latest report before proceeding.")
+    elif audit == "Emphasis of matter / going concern concern":
+        st.warning("Review audit wording and going-concern disclosures carefully.")
+    st.download_button("Download checklist CSV", df.to_csv(index=False).encode("utf-8"), file_name=f"{ticker.replace('.', '_')}_checklist.csv", mime="text/csv")
 
-        growth_scores = [score_metric(rev_growth, 0.20, -0.10), score_metric(earnings_growth, 0.20, -0.20)]
-        growth_scores = [x for x in growth_scores if x is not None]
-        quality_scores = [score_metric(margin, 0.20, -0.05), score_metric(roe, 0.20, 0.0)]
-        quality_scores = [x for x in quality_scores if x is not None]
-        value_score = score_metric(pe, 12, 45, higher_is_better=False) if pe is not None and pe > 0 else None
-        debt_score = score_metric(debt_equity, 50, 200, higher_is_better=False) if debt_equity is not None and debt_equity >= 0 else None
-        quality_combined = [x for x in quality_scores + ([debt_score] if debt_score is not None else []) if x is not None]
-        momentum_score = None
-        if latest_price is not None and latest_sma50 is not None and latest_sma200 is not None:
-            momentum_score = (50 if latest_price >= latest_sma50 else 0) * 0.5 + (50 if latest_sma50 >= latest_sma200 else 0.5 * 50)
-        components = {
-            "Growth": (float(np.mean(growth_scores)) if growth_scores else None, 35),
-            "Valuation": (value_score, 25),
-            "Quality & balance sheet": (float(np.mean(quality_combined)) if quality_combined else None, 25),
-            "Price trend": (momentum_score, 15),
-        }
-        available = [(score, weight) for score, weight in components.values() if score is not None]
-        overall = sum(score * weight for score, weight in available) / sum(weight for score, weight in available) if available else None
-        if overall is None:
-            st.info("Not enough financial data is available to calculate a score for this company.")
+with data_tab:
+    for label, frame in [("Income statement", income), ("Balance sheet", balance), ("Cash flow", cash)]:
+        st.markdown(f"### {label}")
+        if frame is not None and not frame.empty:
+            st.dataframe(frame, use_container_width=True)
         else:
-            st.metric("Available-data score", f"{overall:.0f}/100")
-            st.progress(int(max(0, min(100, overall))))
-        score_rows = []
-        for label, (score, weight) in components.items():
-            score_rows.append({
-                "Category": label,
-                "Score": f"{score:.0f}/100" if score is not None else "N/A",
-                "Model weight": f"{weight}%",
-                "Status": "Calculated" if score is not None else "Missing data"
-            })
-        st.dataframe(pd.DataFrame(score_rows), hide_index=True, use_container_width=True)
-        st.caption("This simple first-version model uses fixed thresholds. It does not account for industry differences, commodity cycles, one-off earnings, dilution, or the full quality of company disclosures.")
-        st.markdown("### Research checklist")
-        st.checkbox("I checked the latest ASX announcements")
-        st.checkbox("I reviewed annual and half-year reports")
-        st.checkbox("I checked cash flow, debt, and possible share dilution")
-        st.checkbox("I compared the company with peers in the same industry")
+            st.info("No statement data returned.")
+    st.markdown("### Recent prices")
+    st.dataframe(hist.tail(30).sort_index(ascending=False), use_container_width=True)
+    st.download_button("Download price history CSV", hist.to_csv().encode("utf-8"), file_name=f"{ticker.replace('.', '_')}_prices.csv", mime="text/csv")
 
-    st.divider()
-    st.markdown("### Export price history")
-    export_df = hist.copy()
-    export_df.index = export_df.index.strftime("%Y-%m-%d")
-    st.download_button(
-        "Download price history as CSV",
-        data=export_df.to_csv().encode("utf-8"),
-        file_name=f"{symbol.replace('.', '_')}_price_history.csv",
-        mime="text/csv"
-    )
-    st.caption(f"Last refreshed in this session: {date.today().isoformat()}. Confirm price timestamps and company fundamentals independently.")
-
-main()
+st.divider()
+st.caption("Personal-use prototype based on the document supplied by the user. Not affiliated with QAV, Stock Doctor, Yahoo Finance or ASX. Verify data and calculations independently.")

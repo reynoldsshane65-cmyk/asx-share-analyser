@@ -1,5 +1,1 @@
-streamlit>=1.35,<2
-yfinance>=0.2.40
-pandas>=2.0
-numpy>=1.24
-matplotlib>=3.7
+streamlit>=1.35,<2\nyfinance>=0.2.40\npandas>=2.0\nnumpy>=1.24\n

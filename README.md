@@ -1,47 +1,50 @@
-# ASX Share Analyser — Free Starter App
+# ASX Share Analyser — GitHub starter files
 
-This is a beginner-friendly Streamlit web app for researching ASX-listed shares using free, unofficial market data.
+Personal-use Streamlit prototype based on the investment checklist document you supplied. Not an official QAV product and not affiliated with QAV, Stock Doctor, Yahoo Finance or ASX.
 
-## What it does
-- Looks up share prices and historical data
-- Displays moving averages, RSI and MACD momentum
-- Displays available fundamental metrics and financial statements
-- Calculates a simple, transparent screening score
-- Exports price history to CSV
+## Files to upload
+- `app.py` — the main app
+- `requirements.txt` — Python packages Streamlit installs
+- `README.md` — this guide
 
-## Important limitations
-- Data is supplied through `yfinance`, which accesses Yahoo Finance data. It is not an official ASX feed and can be delayed, incomplete, or unavailable.
-- Fundamentals may be missing or inconsistent for ASX securities.
-- Scores are rough screening tools, not buy/sell recommendations or financial advice.
-- Verify information with official company reports and ASX announcements.
-- This app is a prototype. It does not save a persistent watchlist, user account, or alerts yet.
+Upload all three files into the **root/top level** of your GitHub repository, not into a subfolder.
 
-## Run on your own computer
-1. Install Python 3.11 or 3.12 from https://www.python.org/downloads/
-2. Extract this folder.
-3. Open a terminal / Command Prompt in this folder.
-4. Run:
-   `python -m pip install -r requirements.txt`
-5. Run:
-   `python -m streamlit run app.py`
-6. A browser tab should open. Enter an ASX ticker such as `BHP` or `BHP.AX`.
+## Streamlit deployment fields
+- **Repository:** your GitHub username/repository name
+- **Branch:** `main` (or the branch name shown in GitHub)
+- **Main file path:** `app.py`
 
-On Windows, if `python` is not recognised, try `py` instead.
+## Included in this version
+- ASX ticker lookup and historical prices using the free, unofficial `yfinance` library
+- Historical price chart, 50-day/200-day moving averages, RSI and MACD
+- Available income statement, balance sheet and cash-flow data
+- Cash-flow-per-share, price/cash, equity-per-share, EPS growth/P-E and intrinsic-value calculations
+- Manual checklist inputs for 3PTL sentiment, recent upturn, historical P/E, equity trend, audit opinion, ownership, external ratings and commodity trend
+- Rule scorecard and CSV downloads
 
-## Publish free online with Streamlit Community Cloud
-1. Create a free GitHub account at https://github.com/
-2. Create a new repository, for example `asx-share-analyser`.
-3. Upload `app.py` and `requirements.txt` from this folder to the repository root.
-4. Go to https://share.streamlit.io/ and sign in with GitHub.
-5. Choose **Create app**, select the repository, branch (usually `main`) and main file path `app.py`.
-6. Deploy. Streamlit will install the requirements and provide a web link.
-7. Open that link on your iPhone and use Safari's **Share → Add to Home Screen** if you want an app-like shortcut.
+## Limitations
+- Free data coverage for ASX shares is inconsistent; unavailable values display as `N/A`.
+- `yfinance` is unofficial, not an official ASX feed. Data may be delayed, incomplete or unavailable.
+- This version analyses one ticker at a time; it does not automatically scan all ASX shares.
+- 3PTL interpretation, audit opinions, founder/board ownership, historic P/E comparisons and external ratings need manual verification.
+- The scoring and valuation formulas are a prototype. Verify each formula and input against your original document and current company reports before relying on results.
+- This is a research aid, not a validated predictor of returns or personal financial advice.
 
-## If something goes wrong
-- Confirm the ticker is valid and try the `.AX` suffix.
-- Wait and retry if Yahoo Finance returns a rate limit or temporary error.
-- If a company has no financial figures, that is a data coverage limitation; check the company's latest reports.
-- Do not enter brokerage passwords, API secrets, or other sensitive information into this app.
+## Deploy for free
+1. Sign in to GitHub and create your repository if you have not already.
+2. Open the repository and choose **Add file → Upload files**.
+3. Upload `app.py`, `requirements.txt` and `README.md`.
+4. Click **Commit changes**.
+5. Open https://share.streamlit.io/ and sign in with GitHub.
+6. Select your repository and branch, set **Main file path** to `app.py`, then deploy.
+7. If deployment fails, open the Streamlit logs and check the error message.
 
-## Free tier caveat
-Hosting providers and data sources can change their free-tier limits and terms. Check current terms before relying on the app or distributing it publicly.
+## Run locally (optional)
+Install Python, open a terminal in this folder, then run:
+```bash
+python -m pip install -r requirements.txt
+python -m streamlit run app.py
+```
+
+## Personal-use / copyright note
+Your supplied document states that its content is for personal use and restricts commercial use without written permission. Keep this project for personal use unless you have confirmed the rights required for distribution or commercial use.
