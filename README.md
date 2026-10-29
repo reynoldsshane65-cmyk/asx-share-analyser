@@ -1,50 +1,25 @@
-# ASX Share Analyser — GitHub starter files
+# ASX Share Analyser — Early-Mover Phase
 
-Personal-use Streamlit prototype based on the investment checklist document you supplied. Not an official QAV product and not affiliated with QAV, Stock Doctor, Yahoo Finance or ASX.
+## Files
+- `app.py` — updated Streamlit app, based on the working `appy_fixed.py` scanner.
+- `ASX_Listed_Companies.csv` — bundled 1,810-code ASX company list.
+- `requirements.txt` — Python dependencies.
 
-## Files to upload
-- `app.py` — the main app
-- `requirements.txt` — Python packages Streamlit installs
-- `README.md` — this guide
+## Deploy/update on Streamlit Community Cloud
+1. Unzip this package.
+2. Upload/replace `app.py`, `requirements.txt`, and `ASX_Listed_Companies.csv` in the same GitHub repository folder.
+3. In Streamlit Community Cloud, make sure the app entry point is `app.py`.
+4. Reboot the app if it does not refresh automatically.
 
-Upload all three files into the **root/top level** of your GitHub repository, not into a subfolder.
+## New in this phase
+- Full-market scan defaults to the bundled ASX list (1,810 codes).
+- Quick promising-shares scan uses the best-scoring available results from the previous scan when present; otherwise it falls back to a smaller starter list.
+- Early-Mover Tracker ranks scanned shares using a transparent technical score from momentum, volume expansion, moving-average strength, and distance from recent highs.
+- Downloadable rankings and tracker CSVs.
+- Add/remove tracked candidates and compare their latest price/score with the values when added.
 
-## Streamlit deployment fields
-- **Repository:** your GitHub username/repository name
-- **Branch:** `main` (or the branch name shown in GitHub)
-- **Main file path:** `app.py`
-
-## Included in this version
-- ASX ticker lookup and historical prices using the free, unofficial `yfinance` library
-- Historical price chart, 50-day/200-day moving averages, RSI and MACD
-- Available income statement, balance sheet and cash-flow data
-- Cash-flow-per-share, price/cash, equity-per-share, EPS growth/P-E and intrinsic-value calculations
-- Manual checklist inputs for 3PTL sentiment, recent upturn, historical P/E, equity trend, audit opinion, ownership, external ratings and commodity trend
-- Rule scorecard and CSV downloads
-
-## Limitations
-- Free data coverage for ASX shares is inconsistent; unavailable values display as `N/A`.
-- `yfinance` is unofficial, not an official ASX feed. Data may be delayed, incomplete or unavailable.
-- This version analyses one ticker at a time; it does not automatically scan all ASX shares.
-- 3PTL interpretation, audit opinions, founder/board ownership, historic P/E comparisons and external ratings need manual verification.
-- The scoring and valuation formulas are a prototype. Verify each formula and input against your original document and current company reports before relying on results.
-- This is a research aid, not a validated predictor of returns or personal financial advice.
-
-## Deploy for free
-1. Sign in to GitHub and create your repository if you have not already.
-2. Open the repository and choose **Add file → Upload files**.
-3. Upload `app.py`, `requirements.txt` and `README.md`.
-4. Click **Commit changes**.
-5. Open https://share.streamlit.io/ and sign in with GitHub.
-6. Select your repository and branch, set **Main file path** to `app.py`, then deploy.
-7. If deployment fails, open the Streamlit logs and check the error message.
-
-## Run locally (optional)
-Install Python, open a terminal in this folder, then run:
-```bash
-python -m pip install -r requirements.txt
-python -m streamlit run app.py
-```
-
-## Personal-use / copyright note
-Your supplied document states that its content is for personal use and restricts commercial use without written permission. Keep this project for personal use unless you have confirmed the rights required for distribution or commercial use.
+## Important limitations
+- This remains a research/screening tool, not an automatic trading system or a reliable prediction of 20–50% returns.
+- The early-mover score is a heuristic, not a probability.
+- Tracker entries live in Streamlit session state and may reset when the app session restarts. Download the tracker CSV to retain a copy.
+- The app currently uses Yahoo Finance data via `yfinance`; missing or delayed data is possible. Verify material company news and announcements directly with ASX.
