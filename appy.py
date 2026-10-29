@@ -3,6 +3,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime
+import time
 
 st.set_page_config(page_title="ASX Share Analyser", page_icon="📈", layout="wide")
 st.title("📈 ASX Share Analyser")
@@ -26,14 +27,20 @@ def load_company(symbol, period):
     except Exception: cash = pd.DataFrame()
     return hist, info, income, balance, cash
 
-@st.cache_data(ttl=900, show_spinner=False)
 def load_prices(symbol, period):
-    try:
-        h = yf.Ticker(symbol).history(period=period, auto_adjust=True)
-        if h is None or h.empty or "Close" not in h: return pd.DataFrame()
-        return h[[c for c in ["Close", "Volume"] if c in h.columns]].dropna(subset=["Close"])
-    except Exception:
-        return pd.DataFrame()
+    """Fetch prices with one retry. Do not cache empty responses, which may be temporary Yahoo throttling."""
+    for attempt in range(2):
+        try:
+            h = yf.Ticker(symbol).history(period=period, auto_adjust=True)
+            if h is not None and not h.empty and "Close" in h:
+                result = h[[c for c in ["Close", "Volume"] if c in h.columns]].dropna(subset=["Close"])
+                if not result.empty:
+                    return result
+        except Exception:
+            pass
+        if attempt == 0:
+            time.sleep(0.25)
+    return pd.DataFrame()
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_info(symbol):
@@ -140,13 +147,22 @@ def score_row(row):
 
 def run_scan(tickers, period):
     rows=[]
+    if not tickers:
+        return pd.DataFrame()
     progress=st.progress(0, text="Preparing scan…")
-    for i,sym in enumerate(tickers):
-        sym=sym.strip().upper().replace(".AX","")
+    total=len(tickers)
+    for i,raw_sym in enumerate(tickers):
+        sym=raw_sym.strip().upper().replace(".AX","")
         ysym=sym+".AX"
         h=load_prices(ysym,period)
         if h.empty or len(h)<30:
-            progress.progress((i+1)/len(tickers),text=f"Checking {sym}…")
+            status = "No price data after 2 attempts" if h.empty else f"Insufficient price history ({len(h)} rows; need 30)"
+            rows.append({"Ticker":sym,"Company":sym,"Price":np.nan,"Return 1W %":np.nan,
+                "Return 1M %":np.nan,"Return 3M %":np.nan,"Return 6M %":np.nan,"Return 12M %":np.nan,
+                "50D Average":np.nan,"200D Average":np.nan,"Above 200D %":np.nan,"Volume Change %":np.nan,
+                "Market Cap":np.nan,"P/E":np.nan,"Revenue Growth %":np.nan,"Profit Margin %":np.nan,
+                "Data Date":"","Scan Status":status})
+            progress.progress((i+1)/total,text=f"Checking {sym} ({i+1}/{total})…")
             continue
         close=h["Close"].dropna()
         vol=h["Volume"].fillna(0) if "Volume" in h else pd.Series(dtype=float)
@@ -181,12 +197,12 @@ def run_scan(tickers, period):
             "Revenue Growth %":revenue_growth if revenue_growth is not None else np.nan,
             "Profit Margin %":profit_margin if profit_margin is not None else np.nan,
             "Fundamentals Status":info_status,
-            "Data Date":close.index[-1].strftime("%Y-%m-%d")
+            "Data Date":close.index[-1].strftime("%Y-%m-%d"),"Scan Status":"Scanned successfully"
         })
-        progress.progress((i+1)/len(tickers),text=f"Scanning {sym}…")
+        progress.progress((i+1)/total,text=f"Scanning {sym} ({i+1}/{total})…")
     progress.empty()
-    if not rows: return pd.DataFrame()
     df=pd.DataFrame(rows)
+    if df.empty: return df
     return pd.concat([df,df.apply(score_row,axis=1)],axis=1)
 
 with st.sidebar:
@@ -198,15 +214,93 @@ with st.sidebar:
     tickers=tickers[:max_tickers]
     scan_label=st.selectbox("Scanner price history",["1 year","2 years","5 years"])
     scan_period={"1 year":"1y","2 years":"2y","5 years":"5y"}[scan_label]
-    if st.button("Clear cached data"): st.cache_data.clear()
+    if st.button("Clear cached data"):
+        st.cache_data.clear()
+        st.session_state.pop("scan_results", None)
+        st.session_state.pop("scan_period", None)
+        st.session_state.pop("scan_time", None)
+        st.session_state.pop("scan_report", None)
+
+    force_full_scan = st.checkbox(
+        "Force full rescan (refresh all tickers)",
+        value=False,
+        help="Normally, existing results are reused and only tickers not already analysed are scanned."
+    )
+
     if st.button("Run / refresh multi-share scan",type="primary",use_container_width=True):
-        if not tickers: st.error("Enter at least one ticker.")
+        if not tickers:
+            st.error("Enter at least one ticker.")
         else:
-            with st.spinner("Scanning shares; larger lists may take several minutes…"):
-                st.session_state["scan_results"]=run_scan(tickers,scan_period)
-                st.session_state["scan_time"]=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            old_df = st.session_state.get("scan_results", pd.DataFrame())
+            old_period = st.session_state.get("scan_period")
+            period_changed = old_period != scan_period
+            can_reuse = (
+                not force_full_scan
+                and not period_changed
+                and isinstance(old_df, pd.DataFrame)
+                and not old_df.empty
+                and "Ticker" in old_df.columns
+            )
+
+            # Reuse previous rows for tickers that are still selected.
+            if can_reuse:
+                selected_set = set(tickers)
+                # Reuse only rows with usable prices. Failed/empty results are retried on the next run.
+                kept_df = old_df[old_df["Ticker"].isin(selected_set)].copy()
+                if "Price" in kept_df.columns:
+                    kept_df = kept_df[kept_df["Price"].notna()].copy()
+                already_done = set(kept_df["Ticker"].astype(str))
+                to_scan = [sym for sym in tickers if sym not in already_done]
+            else:
+                kept_df = pd.DataFrame()
+                to_scan = list(tickers)
+
+            with st.spinner(f"Scanning {len(to_scan)} ticker(s); reusing {len(kept_df)} existing result(s)…"):
+                new_df = run_scan(to_scan, scan_period) if to_scan else pd.DataFrame()
+
+                if kept_df.empty:
+                    combined = new_df
+                elif new_df.empty:
+                    combined = kept_df
+                else:
+                    combined = pd.concat([kept_df, new_df], ignore_index=True, sort=False)
+
+                # Preserve the user's ticker-list order in the stored results.
+                if not combined.empty and "Ticker" in combined.columns:
+                    order = {sym: i for i, sym in enumerate(tickers)}
+                    combined["_order"] = combined["Ticker"].map(order)
+                    combined = combined.sort_values("_order").drop(columns="_order").reset_index(drop=True)
+
+                st.session_state["scan_results"] = combined
+                st.session_state["scan_period"] = scan_period
+                st.session_state["scan_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                st.session_state["scan_report"] = {
+                    "requested": len(tickers),
+                    "reused": len(kept_df),
+                    "newly_scanned": len(to_scan),
+                    "usable": int(combined["Price"].notna().sum()) if "Price" in combined.columns else 0,
+                    "without_usable_data": max(0, len(tickers) - (int(combined["Price"].notna().sum()) if "Price" in combined.columns else 0)),
+                    "force_full": bool(force_full_scan or period_changed or not can_reuse),
+                }
 
 scan=st.session_state.get("scan_results",pd.DataFrame())
+report = st.session_state.get("scan_report")
+if report:
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Tickers requested", report["requested"])
+    m2.metric("Existing results reused", report["reused"])
+    m3.metric("Newly scanned", report["newly_scanned"])
+    m4.metric("Results with usable data", report["usable"])
+    if report["without_usable_data"]:
+        st.warning(
+            f'{report["without_usable_data"]} ticker(s) have no usable price data. '
+            "They are retained in the results with a Scan Status explaining the failure. Some may be valid tickers temporarily blocked by Yahoo Finance."
+        )
+        if not scan.empty and "Scan Status" in scan.columns:
+            failed = scan[scan["Price"].isna()][["Ticker", "Scan Status"]]
+            st.download_button("Download missing / failed tickers CSV", failed.to_csv(index=False).encode(), file_name="asx_failed_tickers.csv", mime="text/csv")
+    else:
+        st.success("Every selected ticker has a result row. This does not guarantee every data field is available.")
 
 def show_scan(score_col,description):
     st.write(description)
@@ -227,7 +321,7 @@ def show_scan(score_col,description):
     st.caption("Scores are heuristics for comparison, not probabilities, forecasts, or buy/sell recommendations.")
     search=st.text_input("Filter by ticker or company",key="search_"+score_col)
     if search: d=d[d["Ticker"].str.contains(search,case=False,na=False)|d["Company"].str.contains(search,case=False,na=False)]
-    cols=["Ticker","Company","Price","Return 1W %","Return 1M %","Return 3M %","Return 6M %","Return 12M %","Momentum Score","Value Score","Growth Score","Overall Score","Market Cap","P/E","Revenue Growth %","Profit Margin %","Fundamentals Status","Data Date"]
+    cols=["Ticker","Company","Price","Return 1W %","Return 1M %","Return 3M %","Return 6M %","Return 12M %","Momentum Score","Value Score","Growth Score","Overall Score","Market Cap","P/E","Revenue Growth %","Profit Margin %","Fundamentals Status","Data Date","Scan Status"]
     if score_col not in cols: cols.insert(8,score_col)
     st.dataframe(d[[c for c in cols if c in d]].round(2),use_container_width=True,hide_index=True)
     st.download_button("Download results CSV",d.to_csv(index=False).encode(),file_name=f"asx_{score_col.lower().replace(' ','_')}.csv",mime="text/csv",key="csv_"+score_col)
