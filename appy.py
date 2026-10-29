@@ -124,7 +124,7 @@ with st.sidebar:
     st.divider()
     ticker_text=st.text_area("ASX tickers (commas or new lines)",", ".join(STARTER_TICKERS),height=130)
     tickers=list(dict.fromkeys(x.strip().upper().replace(".AX","") for x in ticker_text.replace("\n",",").split(",") if x.strip()))
-    max_tickers=st.slider("Maximum tickers per scan",5,150,40,5)
+    max_tickers=st.slider("Maximum tickers per scan",5,2000,40,5)
     tickers=tickers[:max_tickers]
     scan_label=st.selectbox("Scanner price history",["1 year","2 years","5 years"])
     scan_period={"1 year":"1y","2 years":"2y","5 years":"5y"}[scan_label]
