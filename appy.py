@@ -37,8 +37,61 @@ def load_prices(symbol, period):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_info(symbol):
-    try: return yf.Ticker(symbol).info or {}
-    except Exception: return {}
+    """Load Yahoo fundamentals with fallbacks and a diagnostic status."""
+    t = yf.Ticker(symbol)
+    errors = []
+    info = {}
+    # get_info() and .info use the same Yahoo endpoint on many yfinance versions,
+    # but trying both helps with version-specific behaviour.
+    for getter in (lambda: t.get_info(), lambda: t.info):
+        try:
+            candidate = getter()
+            if isinstance(candidate, dict) and candidate:
+                info.update(candidate)
+                break
+        except Exception as exc:
+            errors.append(type(exc).__name__)
+    fast = {}
+    try:
+        fi = t.fast_info
+        for key in ("market_cap", "shares", "last_price", "currency"):
+            try:
+                value = fi.get(key)
+                if value is not None:
+                    fast[key] = value
+            except Exception:
+                pass
+    except Exception as exc:
+        errors.append(type(exc).__name__)
+    return {"info": info, "fast": fast, "error": "; ".join(errors)}
+
+def financial_fallback(symbol):
+    """Derive basic growth/margin metrics from annual statements if Yahoo info is missing."""
+    result = {"revenue_growth": None, "profit_margin": None, "net_income": None, "revenue": None}
+    try:
+        statements = yf.Ticker(symbol).financials
+        if statements is None or statements.empty:
+            return result
+        def latest(names):
+            for name in names:
+                if name in statements.index:
+                    vals = statements.loc[name].dropna()
+                    if len(vals):
+                        return vals
+            return pd.Series(dtype=float)
+        revenue = latest(["Total Revenue", "Operating Revenue"])
+        net = latest(["Net Income", "Net Income Common Stockholders", "Net Income From Continuing Operation Net Minority Interest"])
+        if len(revenue):
+            result["revenue"] = num(revenue.iloc[0])
+            if len(revenue) >= 2 and num(revenue.iloc[1]) not in (None, 0):
+                result["revenue_growth"] = (float(revenue.iloc[0]) / float(revenue.iloc[1]) - 1) * 100
+        if len(net):
+            result["net_income"] = num(net.iloc[0])
+            if result["revenue"] not in (None, 0):
+                result["profit_margin"] = float(net.iloc[0]) / result["revenue"] * 100
+    except Exception:
+        pass
+    return result
 
 def num(x):
     try: return None if x is None or pd.isna(x) else float(x)
@@ -87,8 +140,6 @@ def score_row(row):
 
 def run_scan(tickers, period):
     rows=[]
-    if not tickers:
-        return pd.DataFrame()
     progress=st.progress(0, text="Preparing scan…")
     for i,sym in enumerate(tickers):
         sym=sym.strip().upper().replace(".AX","")
@@ -102,7 +153,23 @@ def run_scan(tickers, period):
         ma200=close.tail(200).mean() if len(close)>=200 else np.nan
         v20=num(vol.tail(20).mean()) if len(vol)>=20 else None
         vprev=num(vol.iloc[-40:-20].mean()) if len(vol)>=40 else None
-        info=load_info(ysym)
+        loaded=load_info(ysym)
+        info=loaded.get("info", {}) if isinstance(loaded, dict) else {}
+        fast=loaded.get("fast", {}) if isinstance(loaded, dict) else {}
+        fundamentals=financial_fallback(ysym) if not info.get("marketCap") or not info.get("revenueGrowth") or not info.get("profitMargins") else {"revenue_growth":None,"profit_margin":None,"net_income":None,"revenue":None}
+        shares=num(info.get("sharesOutstanding")) or num(info.get("impliedSharesOutstanding")) or num(fast.get("shares"))
+        market_cap=num(info.get("marketCap")) or num(fast.get("market_cap")) or (num(close.iloc[-1])*shares if shares else None)
+        revenue_growth=num(info.get("revenueGrowth"))
+        revenue_growth=revenue_growth*100 if revenue_growth is not None else fundamentals.get("revenue_growth")
+        profit_margin=num(info.get("profitMargins"))
+        profit_margin=profit_margin*100 if profit_margin is not None else fundamentals.get("profit_margin")
+        pe=num(info.get("trailingPE"))
+        eps=num(info.get("trailingEps"))
+        if pe is None and eps is None and fundamentals.get("net_income") is not None and shares:
+            eps=fundamentals["net_income"]/shares
+        if pe is None and eps not in (None, 0):
+            pe=num(close.iloc[-1])/eps if eps and eps > 0 else None
+        info_status="Yahoo info OK" if info else ("Partial fallback data" if any(v is not None for v in [market_cap, pe, revenue_growth, profit_margin]) else "Fundamentals unavailable")
         rows.append({
             "Ticker":sym,"Company":info.get("longName") or info.get("shortName") or sym,
             "Price":num(close.iloc[-1]),"Return 1W %":pct(close,5),"Return 1M %":pct(close,21),
@@ -110,9 +177,10 @@ def run_scan(tickers, period):
             "50D Average":num(close.tail(50).mean()) if len(close)>=50 else np.nan,
             "200D Average":num(ma200),"Above 200D %":(close.iloc[-1]/ma200-1)*100 if pd.notna(ma200) and ma200 else np.nan,
             "Volume Change %":(v20/vprev-1)*100 if v20 is not None and vprev not in (None,0) else np.nan,
-            "Market Cap":info.get("marketCap"),"P/E":info.get("trailingPE"),
-            "Revenue Growth %":info.get("revenueGrowth")*100 if num(info.get("revenueGrowth")) is not None else np.nan,
-            "Profit Margin %":info.get("profitMargins")*100 if num(info.get("profitMargins")) is not None else np.nan,
+            "Market Cap":market_cap,"P/E":pe,
+            "Revenue Growth %":revenue_growth if revenue_growth is not None else np.nan,
+            "Profit Margin %":profit_margin if profit_margin is not None else np.nan,
+            "Fundamentals Status":info_status,
             "Data Date":close.index[-1].strftime("%Y-%m-%d")
         })
         progress.progress((i+1)/len(tickers),text=f"Scanning {sym}…")
@@ -130,87 +198,15 @@ with st.sidebar:
     tickers=tickers[:max_tickers]
     scan_label=st.selectbox("Scanner price history",["1 year","2 years","5 years"])
     scan_period={"1 year":"1y","2 years":"2y","5 years":"5y"}[scan_label]
-    if st.button("Clear cached data"):
-        st.cache_data.clear()
-        st.session_state.pop("scan_results", None)
-        st.session_state.pop("scan_period", None)
-        st.session_state.pop("scan_time", None)
-        st.session_state.pop("scan_report", None)
-
-    force_full_scan = st.checkbox(
-        "Force full rescan (refresh all tickers)",
-        value=False,
-        help="Normally, existing results are reused and only tickers not already analysed are scanned."
-    )
-
+    if st.button("Clear cached data"): st.cache_data.clear()
     if st.button("Run / refresh multi-share scan",type="primary",use_container_width=True):
-        if not tickers:
-            st.error("Enter at least one ticker.")
+        if not tickers: st.error("Enter at least one ticker.")
         else:
-            old_df = st.session_state.get("scan_results", pd.DataFrame())
-            old_period = st.session_state.get("scan_period")
-            period_changed = old_period != scan_period
-            can_reuse = (
-                not force_full_scan
-                and not period_changed
-                and isinstance(old_df, pd.DataFrame)
-                and not old_df.empty
-                and "Ticker" in old_df.columns
-            )
-
-            # Reuse previous rows for tickers that are still selected.
-            if can_reuse:
-                selected_set = set(tickers)
-                kept_df = old_df[old_df["Ticker"].isin(selected_set)].copy()
-                already_done = set(kept_df["Ticker"].astype(str))
-                to_scan = [sym for sym in tickers if sym not in already_done]
-            else:
-                kept_df = pd.DataFrame()
-                to_scan = list(tickers)
-
-            with st.spinner(f"Scanning {len(to_scan)} ticker(s); reusing {len(kept_df)} existing result(s)…"):
-                new_df = run_scan(to_scan, scan_period) if to_scan else pd.DataFrame()
-
-                if kept_df.empty:
-                    combined = new_df
-                elif new_df.empty:
-                    combined = kept_df
-                else:
-                    combined = pd.concat([kept_df, new_df], ignore_index=True, sort=False)
-
-                # Preserve the user's ticker-list order in the stored results.
-                if not combined.empty and "Ticker" in combined.columns:
-                    order = {sym: i for i, sym in enumerate(tickers)}
-                    combined["_order"] = combined["Ticker"].map(order)
-                    combined = combined.sort_values("_order").drop(columns="_order").reset_index(drop=True)
-
-                st.session_state["scan_results"] = combined
-                st.session_state["scan_period"] = scan_period
-                st.session_state["scan_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                st.session_state["scan_report"] = {
-                    "requested": len(tickers),
-                    "reused": len(kept_df),
-                    "newly_scanned": len(to_scan),
-                    "usable": len(combined),
-                    "without_usable_data": max(0, len(tickers) - len(combined)),
-                    "force_full": bool(force_full_scan or period_changed or not can_reuse),
-                }
+            with st.spinner("Scanning shares; larger lists may take several minutes…"):
+                st.session_state["scan_results"]=run_scan(tickers,scan_period)
+                st.session_state["scan_time"]=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 scan=st.session_state.get("scan_results",pd.DataFrame())
-report = st.session_state.get("scan_report")
-if report:
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Tickers requested", report["requested"])
-    m2.metric("Existing results reused", report["reused"])
-    m3.metric("Newly scanned", report["newly_scanned"])
-    m4.metric("Results with usable data", report["usable"])
-    if report["without_usable_data"]:
-        st.warning(
-            f'{report["without_usable_data"]} selected ticker(s) have no usable result. '
-            "They may be invalid, suspended, missing history, or temporarily unavailable from Yahoo Finance."
-        )
-    else:
-        st.success("Every selected ticker has a result row. This does not guarantee every data field is available.")
 
 def show_scan(score_col,description):
     st.write(description)
@@ -231,7 +227,7 @@ def show_scan(score_col,description):
     st.caption("Scores are heuristics for comparison, not probabilities, forecasts, or buy/sell recommendations.")
     search=st.text_input("Filter by ticker or company",key="search_"+score_col)
     if search: d=d[d["Ticker"].str.contains(search,case=False,na=False)|d["Company"].str.contains(search,case=False,na=False)]
-    cols=["Ticker","Company","Price","Return 1W %","Return 1M %","Return 3M %","Return 6M %","Return 12M %","Momentum Score","Value Score","Growth Score","Overall Score","Market Cap","P/E","Revenue Growth %","Profit Margin %","Data Date"]
+    cols=["Ticker","Company","Price","Return 1W %","Return 1M %","Return 3M %","Return 6M %","Return 12M %","Momentum Score","Value Score","Growth Score","Overall Score","Market Cap","P/E","Revenue Growth %","Profit Margin %","Fundamentals Status","Data Date"]
     if score_col not in cols: cols.insert(8,score_col)
     st.dataframe(d[[c for c in cols if c in d]].round(2),use_container_width=True,hide_index=True)
     st.download_button("Download results CSV",d.to_csv(index=False).encode(),file_name=f"asx_{score_col.lower().replace(' ','_')}.csv",mime="text/csv",key="csv_"+score_col)
