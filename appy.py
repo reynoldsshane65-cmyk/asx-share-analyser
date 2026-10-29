@@ -87,6 +87,8 @@ def score_row(row):
 
 def run_scan(tickers, period):
     rows=[]
+    if not tickers:
+        return pd.DataFrame()
     progress=st.progress(0, text="Preparing scan…")
     for i,sym in enumerate(tickers):
         sym=sym.strip().upper().replace(".AX","")
@@ -128,15 +130,87 @@ with st.sidebar:
     tickers=tickers[:max_tickers]
     scan_label=st.selectbox("Scanner price history",["1 year","2 years","5 years"])
     scan_period={"1 year":"1y","2 years":"2y","5 years":"5y"}[scan_label]
-    if st.button("Clear cached data"): st.cache_data.clear()
+    if st.button("Clear cached data"):
+        st.cache_data.clear()
+        st.session_state.pop("scan_results", None)
+        st.session_state.pop("scan_period", None)
+        st.session_state.pop("scan_time", None)
+        st.session_state.pop("scan_report", None)
+
+    force_full_scan = st.checkbox(
+        "Force full rescan (refresh all tickers)",
+        value=False,
+        help="Normally, existing results are reused and only tickers not already analysed are scanned."
+    )
+
     if st.button("Run / refresh multi-share scan",type="primary",use_container_width=True):
-        if not tickers: st.error("Enter at least one ticker.")
+        if not tickers:
+            st.error("Enter at least one ticker.")
         else:
-            with st.spinner("Scanning shares; larger lists may take several minutes…"):
-                st.session_state["scan_results"]=run_scan(tickers,scan_period)
-                st.session_state["scan_time"]=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            old_df = st.session_state.get("scan_results", pd.DataFrame())
+            old_period = st.session_state.get("scan_period")
+            period_changed = old_period != scan_period
+            can_reuse = (
+                not force_full_scan
+                and not period_changed
+                and isinstance(old_df, pd.DataFrame)
+                and not old_df.empty
+                and "Ticker" in old_df.columns
+            )
+
+            # Reuse previous rows for tickers that are still selected.
+            if can_reuse:
+                selected_set = set(tickers)
+                kept_df = old_df[old_df["Ticker"].isin(selected_set)].copy()
+                already_done = set(kept_df["Ticker"].astype(str))
+                to_scan = [sym for sym in tickers if sym not in already_done]
+            else:
+                kept_df = pd.DataFrame()
+                to_scan = list(tickers)
+
+            with st.spinner(f"Scanning {len(to_scan)} ticker(s); reusing {len(kept_df)} existing result(s)…"):
+                new_df = run_scan(to_scan, scan_period) if to_scan else pd.DataFrame()
+
+                if kept_df.empty:
+                    combined = new_df
+                elif new_df.empty:
+                    combined = kept_df
+                else:
+                    combined = pd.concat([kept_df, new_df], ignore_index=True, sort=False)
+
+                # Preserve the user's ticker-list order in the stored results.
+                if not combined.empty and "Ticker" in combined.columns:
+                    order = {sym: i for i, sym in enumerate(tickers)}
+                    combined["_order"] = combined["Ticker"].map(order)
+                    combined = combined.sort_values("_order").drop(columns="_order").reset_index(drop=True)
+
+                st.session_state["scan_results"] = combined
+                st.session_state["scan_period"] = scan_period
+                st.session_state["scan_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                st.session_state["scan_report"] = {
+                    "requested": len(tickers),
+                    "reused": len(kept_df),
+                    "newly_scanned": len(to_scan),
+                    "usable": len(combined),
+                    "without_usable_data": max(0, len(tickers) - len(combined)),
+                    "force_full": bool(force_full_scan or period_changed or not can_reuse),
+                }
 
 scan=st.session_state.get("scan_results",pd.DataFrame())
+report = st.session_state.get("scan_report")
+if report:
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Tickers requested", report["requested"])
+    m2.metric("Existing results reused", report["reused"])
+    m3.metric("Newly scanned", report["newly_scanned"])
+    m4.metric("Results with usable data", report["usable"])
+    if report["without_usable_data"]:
+        st.warning(
+            f'{report["without_usable_data"]} selected ticker(s) have no usable result. '
+            "They may be invalid, suspended, missing history, or temporarily unavailable from Yahoo Finance."
+        )
+    else:
+        st.success("Every selected ticker has a result row. This does not guarantee every data field is available.")
 
 def show_scan(score_col,description):
     st.write(description)
