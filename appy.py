@@ -145,65 +145,134 @@ def score_row(row):
     overall = sum(v*w for v,w in available)/sum(w for _,w in available) if available else np.nan
     return pd.Series({"Momentum Score":round(mom,1) if pd.notna(mom) else np.nan,"Value Score":round(val,1) if pd.notna(val) else np.nan,"Growth Score":round(gro,1) if pd.notna(gro) else np.nan,"Overall Score":round(overall,1) if pd.notna(overall) else np.nan})
 
+@st.cache_data(ttl=900, show_spinner=False)
+def download_price_batches(tickers, period, batch_size=30):
+    """
+    Download price history in small batches instead of making a separate price
+    request for every ticker. This reduces request pressure and avoids the
+    cascade of failures seen when Yahoo throttles repeated per-ticker requests.
+    """
+    output = {}
+    symbols = [str(x).strip().upper().replace(".AX", "") for x in tickers if str(x).strip()]
+    for start in range(0, len(symbols), batch_size):
+        batch = symbols[start:start + batch_size]
+        yahoo_symbols = [s + ".AX" for s in batch]
+        data = pd.DataFrame()
+        for attempt in range(3):
+            try:
+                data = yf.download(
+                    tickers=" ".join(yahoo_symbols),
+                    period=period,
+                    auto_adjust=True,
+                    group_by="ticker",
+                    threads=False,
+                    progress=False,
+                    timeout=25
+                )
+                if data is not None and not data.empty:
+                    break
+            except Exception:
+                data = pd.DataFrame()
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
+        for sym, ysym in zip(batch, yahoo_symbols):
+            try:
+                if data is None or data.empty:
+                    output[sym] = pd.DataFrame()
+                    continue
+                if isinstance(data.columns, pd.MultiIndex):
+                    # group_by="ticker" normally gives ticker as level 0.
+                    if ysym in data.columns.get_level_values(0):
+                        h = data[ysym].copy()
+                    elif ysym in data.columns.get_level_values(-1):
+                        h = data.xs(ysym, axis=1, level=-1).copy()
+                    else:
+                        output[sym] = pd.DataFrame()
+                        continue
+                else:
+                    # Single-symbol downloads can return flat columns.
+                    h = data.copy() if len(batch) == 1 else pd.DataFrame()
+                wanted = [c for c in ["Close", "Volume"] if c in h.columns]
+                h = h[wanted].dropna(subset=["Close"]) if "Close" in wanted else pd.DataFrame()
+                output[sym] = h
+            except Exception:
+                output[sym] = pd.DataFrame()
+        time.sleep(1.0)  # modest pause between batches
+    return output
+
+
 def run_scan(tickers, period):
-    rows=[]
+    rows = []
     if not tickers:
         return pd.DataFrame()
-    progress=st.progress(0, text="Preparing scan…")
-    total=len(tickers)
-    for i,raw_sym in enumerate(tickers):
-        sym=raw_sym.strip().upper().replace(".AX","")
-        ysym=sym+".AX"
-        h=load_prices(ysym,period)
-        if h.empty or len(h)<30:
-            status = "No price data after 2 attempts" if h.empty else f"Insufficient price history ({len(h)} rows; need 30)"
-            rows.append({"Ticker":sym,"Company":sym,"Price":np.nan,"Return 1W %":np.nan,
-                "Return 1M %":np.nan,"Return 3M %":np.nan,"Return 6M %":np.nan,"Return 12M %":np.nan,
-                "50D Average":np.nan,"200D Average":np.nan,"Above 200D %":np.nan,"Volume Change %":np.nan,
-                "Market Cap":np.nan,"P/E":np.nan,"Revenue Growth %":np.nan,"Profit Margin %":np.nan,
-                "Data Date":"","Scan Status":status})
-            progress.progress((i+1)/total,text=f"Checking {sym} ({i+1}/{total})…")
+
+    # Fetch price history in batches first. This prevents individual price
+    # requests and financial-data requests interleaving until Yahoo throttles.
+    progress = st.progress(0, text="Downloading price history in batches…")
+    price_data = download_price_batches(tickers, period, batch_size=30)
+    progress.progress(0.15, text="Price downloads finished; calculating results…")
+    total = len(tickers)
+
+    for i, raw_sym in enumerate(tickers):
+        sym = raw_sym.strip().upper().replace(".AX", "")
+        h = price_data.get(sym, pd.DataFrame())
+        if h is None or h.empty or len(h) < 30:
+            status = "No price data from batch download" if h is None or h.empty else f"Insufficient price history ({len(h)} rows; need 30)"
+            rows.append({
+                "Ticker": sym, "Company": sym, "Price": np.nan,
+                "Return 1W %": np.nan, "Return 1M %": np.nan,
+                "Return 3M %": np.nan, "Return 6M %": np.nan,
+                "Return 12M %": np.nan, "50D Average": np.nan,
+                "200D Average": np.nan, "Above 200D %": np.nan,
+                "Volume Change %": np.nan, "Market Cap": np.nan,
+                "P/E": np.nan, "Revenue Growth %": np.nan,
+                "Profit Margin %": np.nan, "Fundamentals Status": "Not fetched (no prices)",
+                "Data Date": "", "Scan Status": status
+            })
+            progress.progress(0.15 + 0.85 * (i + 1) / total, text=f"Checking {sym} ({i+1}/{total})…")
             continue
-        close=h["Close"].dropna()
-        vol=h["Volume"].fillna(0) if "Volume" in h else pd.Series(dtype=float)
-        ma200=close.tail(200).mean() if len(close)>=200 else np.nan
-        v20=num(vol.tail(20).mean()) if len(vol)>=20 else None
-        vprev=num(vol.iloc[-40:-20].mean()) if len(vol)>=40 else None
-        loaded=load_info(ysym)
-        info=loaded.get("info", {}) if isinstance(loaded, dict) else {}
-        fast=loaded.get("fast", {}) if isinstance(loaded, dict) else {}
-        fundamentals=financial_fallback(ysym) if not info.get("marketCap") or not info.get("revenueGrowth") or not info.get("profitMargins") else {"revenue_growth":None,"profit_margin":None,"net_income":None,"revenue":None}
-        shares=num(info.get("sharesOutstanding")) or num(info.get("impliedSharesOutstanding")) or num(fast.get("shares"))
-        market_cap=num(info.get("marketCap")) or num(fast.get("market_cap")) or (num(close.iloc[-1])*shares if shares else None)
-        revenue_growth=num(info.get("revenueGrowth"))
-        revenue_growth=revenue_growth*100 if revenue_growth is not None else fundamentals.get("revenue_growth")
-        profit_margin=num(info.get("profitMargins"))
-        profit_margin=profit_margin*100 if profit_margin is not None else fundamentals.get("profit_margin")
-        pe=num(info.get("trailingPE"))
-        eps=num(info.get("trailingEps"))
-        if pe is None and eps is None and fundamentals.get("net_income") is not None and shares:
-            eps=fundamentals["net_income"]/shares
-        if pe is None and eps not in (None, 0):
-            pe=num(close.iloc[-1])/eps if eps and eps > 0 else None
-        info_status="Yahoo info OK" if info else ("Partial fallback data" if any(v is not None for v in [market_cap, pe, revenue_growth, profit_margin]) else "Fundamentals unavailable")
+
+        close = h["Close"].dropna()
+        vol = h["Volume"].fillna(0) if "Volume" in h else pd.Series(dtype=float)
+        ma200 = close.tail(200).mean() if len(close) >= 200 else np.nan
+        v20 = num(vol.tail(20).mean()) if len(vol) >= 20 else None
+        vprev = num(vol.iloc[-40:-20].mean()) if len(vol) >= 40 else None
+
+        # Limit fundamental calls during a full-market scan. Fetch one info
+        # payload only; don't request financial statements for every missing field.
+        loaded = load_info(sym + ".AX")
+        info = loaded.get("info", {}) if isinstance(loaded, dict) else {}
+        fast = loaded.get("fast", {}) if isinstance(loaded, dict) else {}
+        shares = num(info.get("sharesOutstanding")) or num(info.get("impliedSharesOutstanding")) or num(fast.get("shares"))
+        market_cap = num(info.get("marketCap")) or num(fast.get("market_cap")) or (num(close.iloc[-1]) * shares if shares else None)
+        pe = num(info.get("trailingPE"))
+        revenue_growth = num(info.get("revenueGrowth"))
+        revenue_growth = revenue_growth * 100 if revenue_growth is not None else np.nan
+        profit_margin = num(info.get("profitMargins"))
+        profit_margin = profit_margin * 100 if profit_margin is not None else np.nan
+        fundamentals_status = "Yahoo info OK" if info else "Fundamentals unavailable (price data available)"
+
         rows.append({
-            "Ticker":sym,"Company":info.get("longName") or info.get("shortName") or sym,
-            "Price":num(close.iloc[-1]),"Return 1W %":pct(close,5),"Return 1M %":pct(close,21),
-            "Return 3M %":pct(close,63),"Return 6M %":pct(close,126),"Return 12M %":pct(close,252),
-            "50D Average":num(close.tail(50).mean()) if len(close)>=50 else np.nan,
-            "200D Average":num(ma200),"Above 200D %":(close.iloc[-1]/ma200-1)*100 if pd.notna(ma200) and ma200 else np.nan,
-            "Volume Change %":(v20/vprev-1)*100 if v20 is not None and vprev not in (None,0) else np.nan,
-            "Market Cap":market_cap,"P/E":pe,
-            "Revenue Growth %":revenue_growth if revenue_growth is not None else np.nan,
-            "Profit Margin %":profit_margin if profit_margin is not None else np.nan,
-            "Fundamentals Status":info_status,
-            "Data Date":close.index[-1].strftime("%Y-%m-%d"),"Scan Status":"Scanned successfully"
+            "Ticker": sym, "Company": info.get("longName") or info.get("shortName") or sym,
+            "Price": num(close.iloc[-1]), "Return 1W %": pct(close, 5),
+            "Return 1M %": pct(close, 21), "Return 3M %": pct(close, 63),
+            "Return 6M %": pct(close, 126), "Return 12M %": pct(close, 252),
+            "50D Average": num(close.tail(50).mean()) if len(close) >= 50 else np.nan,
+            "200D Average": num(ma200),
+            "Above 200D %": (close.iloc[-1] / ma200 - 1) * 100 if pd.notna(ma200) and ma200 else np.nan,
+            "Volume Change %": (v20 / vprev - 1) * 100 if v20 is not None and vprev not in (None, 0) else np.nan,
+            "Market Cap": market_cap, "P/E": pe, "Revenue Growth %": revenue_growth,
+            "Profit Margin %": profit_margin, "Fundamentals Status": fundamentals_status,
+            "Data Date": close.index[-1].strftime("%Y-%m-%d"),
+            "Scan Status": "Scanned successfully"
         })
-        progress.progress((i+1)/total,text=f"Scanning {sym} ({i+1}/{total})…")
+        progress.progress(0.15 + 0.85 * (i + 1) / total, text=f"Processing {sym} ({i+1}/{total})…")
+
     progress.empty()
-    df=pd.DataFrame(rows)
-    if df.empty: return df
-    return pd.concat([df,df.apply(score_row,axis=1)],axis=1)
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    return pd.concat([df, df.apply(score_row, axis=1)], axis=1)
 
 with st.sidebar:
     page=st.radio("Page",["Single-Share Analysis","Automatic Share Scanner","Lower-Risk Investing","Value Investing","Momentum Trading","High-Growth Shares","Long-Term Investing","Portfolio Planner"])
