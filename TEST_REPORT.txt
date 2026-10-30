@@ -1,0 +1,38 @@
+ASX Phase 5 VPA + Phase 4 restoration - verification
+30 October 2026
+
+PASS - Python syntax/AST parsing.
+PASS - All original Phase 5 function names remain present.
+PASS - Nine existing functions are structurally unchanged: calculate_vpa,
+       refresh_vpa_results, download_price_batches, load_company, load_prices,
+       load_info, financial_fallback, show_scan and score_row.
+
+Six offline integration groups passed using real pandas, NumPy and SQLite:
+1. Create the original Phase 5 schema with a saved prediction, migrate it and
+   confirm the prediction survives and historical tables/new horizons exist.
+2. Generate historical VPA/technical rows, verify future returns, perturb later
+   prices and confirm earlier features do not change; repeat storage without
+   duplicate records.
+3. Train combined historical learning weights, check cutoff filtering and
+   normalization, load display rows, round-trip OHLCV cache, resume saved job
+   progress and execute the learned-versus-fixed holdout calculation.
+4. Save a live prediction with VPA, reject duplicates, retain distribution safety,
+   refresh all five outcome horizons and verify a SQLite backup's integrity.
+5. Process a batch with successful and missing-history shares, record the failure
+   and reuse cached history when the simulated online download is unavailable.
+6. Run the live scanner on synthetic OHLCV and render populated branches for
+   Phase 4 Backtest, Prediction Lab, VPA Scanner, Early-Mover Tracker, automatic
+   scanner, all five investment screens and Portfolio Planner through a simulated
+   Streamlit adapter. Exercise both one-batch and all-remaining-batches paths and
+   assert their saved progress. Single-share visual rendering was not exercised.
+
+LIMITS
+Streamlit and yfinance are not installed in the available runtime. Dependency
+downloads failed because network name resolution was blocked, and automatic
+approval review rejected the retry outside that restriction. Therefore these
+are logic/integration tests with simulated Streamlit and Yahoo responses, not a
+real Streamlit browser run or live Yahoo Finance/network test. GitHub upload and
+Streamlit deployment were not performed. A live deployment smoke test remains.
+
+No user's prediction database was opened or modified. Test databases and synthetic
+market data were isolated in the working directory and are excluded from the ZIP.
