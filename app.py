@@ -388,9 +388,12 @@ def save_predictions(frame, weights):
     for _,r in frame.iterrows():
         ticker=str(r.get("Ticker","")); price=num(r.get("Price")); date=str(r.get("Data Date", ""))[:10]
         if not ticker or price is None or price<=0 or not date: continue
+        # Calculate component scores before using them in the feature record.
+        # Previously `comps` was referenced one line too early, causing
+        # UnboundLocalError whenever a prediction was saved.
+        comps=component_scores(r)
         features={k:num(r.get(k)) for k in FEATURES[:7]}
         features[FEATURES[7]]=comps[7]
-        comps=component_scores(r)
         try:
             cur=con.execute("INSERT OR IGNORE INTO predictions (ticker,company,signal_date,entry_price,base_score,components_json,features_json,weights_json) VALUES (?,?,?,?,?,?,?,?)",
                 (ticker,str(r.get("Company",ticker)),date,float(price),num(r.get("Early-Mover Score")),json.dumps(comps),json.dumps(features),json.dumps(weights.tolist())))
