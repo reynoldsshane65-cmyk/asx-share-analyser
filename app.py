@@ -446,20 +446,28 @@ def component_scores(row):
     ]
     return [None if pd.isna(x) else float(x) for x in values]
 
-def learned_weights():
+def learned_weights(cutoff_date=None):
     con=db_connect()
     # A full-universe history may contain millions of rows. Stream through them
     # and retain only the sums needed to calculate each indicator correlation.
-    cursors=[con.execute("""WITH observations AS (
+    historical_filter="WHERE h.return_20d IS NOT NULL"
+    live_filter="WHERE p.return_20d IS NOT NULL"
+    query_params=[]
+    if cutoff_date:
+        historical_filter+=" AND h.signal_date < ?"
+        live_filter+=" AND p.signal_date < ?"
+        query_params=[cutoff_date,cutoff_date]
+    query="""WITH observations AS (
           SELECT h.ticker,h.signal_date,h.features_json,h.return_20d FROM historical_learning_monthly h
-          WHERE h.return_20d IS NOT NULL
+          """+historical_filter+"""
           UNION ALL
-          SELECT p.ticker,p.signal_date,p.features_json,p.return_20d FROM predictions p WHERE p.return_20d IS NOT NULL
+          SELECT p.ticker,p.signal_date,p.features_json,p.return_20d FROM predictions p """+live_filter+"""
         ), monthly AS (
           SELECT features_json,return_20d,
                  ROW_NUMBER() OVER (PARTITION BY ticker,substr(signal_date,1,7) ORDER BY signal_date) AS month_row
           FROM observations
-        ) SELECT features_json,return_20d FROM monthly WHERE month_row=1""")]
+        ) SELECT features_json,return_20d FROM monthly WHERE month_row=1"""
+    cursors=[con.execute(query,query_params)]
     stats={feature:[0,0.0,0.0,0.0,0.0,0.0] for feature in FEATURES}
     observations=0
     for cursor in cursors:
@@ -492,6 +500,50 @@ def learned_weights():
     weights=BASE_WEIGHTS*multipliers
     weights=weights/weights.sum()
     return weights, observations, True, correlations
+
+def learning_source_counts():
+    con=db_connect()
+    historical=int(con.execute("SELECT COUNT(*) FROM historical_learning_monthly WHERE return_20d IS NOT NULL").fetchone()[0])
+    live=int(con.execute("SELECT COUNT(*) FROM predictions WHERE return_20d IS NOT NULL").fetchone()[0])
+    con.close()
+    return historical,live
+
+def render_learning_dashboard():
+    st.subheader("Learning status")
+    weights,n,active,corr=learned_weights()
+    historical_examples,live_examples=learning_source_counts()
+    source_cols=st.columns(3)
+    source_cols[0].metric("Historical monthly examples",historical_examples,help="Phase 4 backtest observations with a completed 20-trading-day outcome.")
+    source_cols[1].metric("Live predictions with 20-day outcomes",live_examples)
+    source_cols[2].metric("Effective examples used",n,help="The model keeps about one 20-day training example per ticker per calendar month to reduce overlap.")
+    if active:
+        learned=pd.DataFrame({"Indicator":FEATURES,"Original weight %":BASE_WEIGHTS*100,"Learned weight %":weights*100,"Change (percentage points)":(weights-BASE_WEIGHTS)*100,"Correlation with 20-day return":corr})
+        st.dataframe(learned.round(3),use_container_width=True,hide_index=True)
+        st.caption("Adaptive weights are active. Correlations are descriptive, not causal, and weights are blended conservatively with the base weights.")
+    else:
+        st.info(f"Adaptive scoring is not active yet. {n}/30 effective completed 20-day examples are available; the original weights are still used.")
+
+def render_learning_dashboard():
+    st.subheader("Learning status")
+    weights,n,active,corr=learned_weights()
+    historical_examples,live_examples=learning_source_counts()
+    source_cols=st.columns(3)
+    source_cols[0].metric("Historical monthly examples",historical_examples,help="Phase 4 backtest observations with a completed 20-trading-day outcome.")
+    source_cols[1].metric("Live predictions with 20-day outcomes",live_examples)
+    source_cols[2].metric("Effective examples used",n,help="The model keeps about one 20-day training example per ticker per calendar month to reduce overlap.")
+    if active:
+        learned=pd.DataFrame({"Indicator":FEATURES,"Original weight %":BASE_WEIGHTS*100,"Learned weight %":weights*100,"Change (percentage points)":(weights-BASE_WEIGHTS)*100,"Correlation with 20-day return":corr})
+        st.dataframe(learned.round(3),use_container_width=True,hide_index=True)
+        st.caption("Adaptive weights are active. Correlations are descriptive, not causal, and weights are blended conservatively with the base weights.")
+    else:
+        st.info(f"Adaptive scoring is not active yet. {n}/30 effective completed 20-day examples are available; the original weights are still used.")
+
+def learning_source_counts():
+    con=db_connect()
+    historical=int(con.execute("SELECT COUNT(*) FROM historical_learning_monthly WHERE return_20d IS NOT NULL").fetchone()[0])
+    live=int(con.execute("SELECT COUNT(*) FROM predictions WHERE return_20d IS NOT NULL").fetchone()[0])
+    con.close()
+    return historical,live
 
 def score_with_weights(row, weights):
     comps=component_scores(row)
@@ -753,6 +805,41 @@ def backtest_metrics(frame, horizon):
         "Median return %": values.median() if len(values) else np.nan,
         "Negative return %": values.lt(0).mean()*100 if len(values) else np.nan,
     }
+
+def evaluate_learned_holdout(frame, threshold):
+    """Train on early matured observations, then compare fixed/adaptive scores on later rows."""
+    if frame is None or len(frame)<60:
+        return None,"Need at least 60 sampled historical rows to make a time-separated comparison."
+    dates=pd.to_datetime(frame["Signal date"],errors="coerce").dropna().sort_values().reset_index(drop=True)
+    if len(dates)<60:
+        return None,"Not enough valid signal dates for a holdout comparison."
+    split_date=dates.iloc[int(len(dates)*0.70)]
+    # Exclude training signals whose 20-session outcomes could extend into the test period.
+    train_cutoff=split_date-pd.Timedelta(days=45)
+    weights,train_count,active,_=learned_weights(train_cutoff.strftime("%Y-%m-%d"))
+    test=frame[pd.to_datetime(frame["Signal date"],errors="coerce")>=split_date].copy()
+    if not active or train_count<30:
+        return None,f"Only {train_count} effective matured examples were available before the holdout date; at least 30 are needed."
+    if len(test)<20:
+        return None,"The later holdout portion has too few rows to compare reliably."
+    test["Fixed score"]=pd.to_numeric(test["Score"],errors="coerce")
+    test["Learned score"]=test.apply(lambda row:score_with_weights(row,weights),axis=1)
+    result_rows=[]
+    top_n=max(1,int(np.ceil(len(test)*0.20)))
+    for method,score_col in (("Fixed weights","Fixed score"),("Learned weights","Learned score")):
+        selections=[("At score threshold",test[test[score_col]>=threshold]),("Top 20% of scores",test.nlargest(top_n,score_col))]
+        for basis,selected in selections:
+            for horizon in (5,10,20,30):
+                values=pd.to_numeric(selected[f"Return {horizon}d %"],errors="coerce").dropna()
+                result_rows.append({"Scoring method":method,"Selection rule":basis,"Horizon (trading days)":horizon,
+                    "Signals":len(values),"Positive return %":values.gt(0).mean()*100 if len(values) else np.nan,
+                    "Average return %":values.mean() if len(values) else np.nan,
+                    "Median return %":values.median() if len(values) else np.nan,
+                    "False positive %":values.lt(0).mean()*100 if len(values) else np.nan})
+    weights_table=pd.DataFrame({"Indicator":FEATURES,"Base weight %":BASE_WEIGHTS*100,"Weights learned before holdout %":weights*100,"Change (percentage points)":(weights-BASE_WEIGHTS)*100})
+    return {"metrics":pd.DataFrame(result_rows),"weights":weights_table,"train_count":train_count,
+            "train_cutoff":train_cutoff.strftime("%Y-%m-%d"),"test_start":pd.Timestamp(split_date).strftime("%Y-%m-%d"),
+            "test_rows":len(test)},None
 
 
 MASTER_TICKERS = load_master_tickers()
@@ -1068,6 +1155,7 @@ elif page=="Prediction Lab":
             count=refresh_prediction_outcomes()
         st.success(f"Updated outcomes for {count} prediction(s).")
     con=db_connect(); predictions=pd.read_sql_query("SELECT * FROM predictions ORDER BY signal_date DESC,id DESC",con); con.close()
+    render_learning_dashboard()
     if predictions.empty:
         st.info("No predictions recorded yet. Go to Early-Mover Tracker, select shares and choose 'Save selected predictions to history'.")
     else:
@@ -1083,14 +1171,6 @@ elif page=="Prediction Lab":
             vals=pd.to_numeric(predictions[f"return_{h}d"],errors="coerce").dropna()
             summaries.append({"Horizon":f"{h} trading days","Completed":len(vals),"Positive %":round((vals>0).mean()*100,1) if len(vals) else np.nan,"Average return %":round(vals.mean(),2) if len(vals) else np.nan,"Median return %":round(vals.median(),2) if len(vals) else np.nan})
         st.dataframe(pd.DataFrame(summaries),use_container_width=True,hide_index=True)
-        st.subheader("What the system is learning")
-        weights,n,active,corr=learned_weights()
-        if active:
-            learned=pd.DataFrame({"Indicator":FEATURES,"Original weight %":BASE_WEIGHTS*100,"Learned weight %":weights*100,"Correlation with 20-day return":corr})
-            st.dataframe(learned.round(3),use_container_width=True,hide_index=True)
-            st.caption("Training combines saved live predictions and historical backtest observations. It uses about one matured 20-day outcome per ticker per month to reduce overlap; at least 30 such observations are required. Correlations are descriptive, not causal, and weights are blended conservatively with the base weights.")
-        else:
-            st.info(f"The adaptive scoring is not active yet. {n}/30 completed 20-day outcomes are available. Until then, the original weights are used.")
         st.subheader("Individual predictions")
         view_cols=["ticker","company","signal_date","entry_price","base_score","price_5d","return_5d","price_10d","return_10d","price_20d","return_20d","price_30d","return_30d","price_60d","return_60d"]
         view=predictions[view_cols].copy()
@@ -1125,8 +1205,10 @@ elif page=="Phase 4 Backtest":
     st.progress(done/max(1,len(backtest_codes)),text=f"Universe progress: {done:,} of {len(backtest_codes):,} shares processed")
     con=db_connect()
     cached_tickers,cached_rows=con.execute("SELECT COUNT(DISTINCT ticker),COUNT(*) FROM historical_prices").fetchone()
+    cached_codes={row[0] for row in con.execute("SELECT DISTINCT ticker FROM historical_prices").fetchall()}
     con.close()
-    st.caption(f"Local cache currently holds {cached_rows:,} daily OHLCV records across {cached_tickers:,} tickers. Completed batches and learning observations remain in the app's SQLite database between reruns; back up that database before replacing or migrating the app.")
+    cached_in_universe=len(set(backtest_codes)&cached_codes)
+    st.caption(f"This run has attempted {done:,}/{len(backtest_codes):,} codes; {cached_in_universe:,} have cached history. The local cache contains {cached_rows:,} daily OHLCV records across {cached_tickers:,} tickers. Progress counts attempted codes, so check the unavailable-share list too. Data and progress are in SQLite; back it up before replacing the app.")
     col_auto,col_single,col_reset=st.columns(3)
     run_all=col_auto.button("Run all remaining batches automatically",type="primary",key="p4_run_all",disabled=(done>=len(backtest_codes) or not backtest_codes))
     run_batch=col_single.button(f"Run one batch ({min(batch_size,max(0,len(backtest_codes)-done))})",key="p4_run_batch",disabled=(done>=len(backtest_codes) or not backtest_codes))
@@ -1197,6 +1279,27 @@ elif page=="Phase 4 Backtest":
                 diagnostics.append({"Indicator":feature,"Sample count":len(pair),"Correlation with forward return":corr})
         st.dataframe(pd.DataFrame(diagnostics).round(3),use_container_width=True,hide_index=True)
         st.download_button("Download displayed backtest rows CSV",bt.to_csv(index=False).encode(),file_name="asx_phase4_historical_backtest_sample.csv",mime="text/csv")
+        st.subheader("Did learned weights help on later, unseen history?")
+        st.write("This check trains weights only on matured outcomes from earlier dates, leaves a 45-day gap, then compares fixed and learned scores on the later holdout period. It tests whether the indicators ranked the later sample better; it cannot guarantee future performance.")
+        holdout_key=(tuple(sorted(backtest_codes)),int(interval),int(cutoff))
+        if st.button("Run learned-versus-fixed holdout check",key="p4_holdout_check"):
+            holdout_result,holdout_error=evaluate_learned_holdout(bt,cutoff)
+            st.session_state["p4_holdout_result"]={"key":holdout_key,"result":holdout_result,"error":holdout_error}
+        saved_holdout=st.session_state.get("p4_holdout_result")
+        if saved_holdout and saved_holdout.get("key")==holdout_key:
+            if saved_holdout.get("error"):
+                st.info(saved_holdout["error"])
+            else:
+                holdout=saved_holdout["result"]
+                st.caption(f"Trained on {holdout['train_count']:,} effective examples dated before {holdout['train_cutoff']}; evaluated {holdout['test_rows']:,} displayed historical rows from {holdout['test_start']} onward.")
+                st.dataframe(holdout["metrics"].round(2),use_container_width=True,hide_index=True)
+                st.markdown("**Weights learned from the earlier period**")
+                st.dataframe(holdout["weights"].round(3),use_container_width=True,hide_index=True)
+                st.caption("Look for learned weights to improve positive-return rates and average returns on the later test rows, especially under the equal-sized Top 20% comparison. If results are mixed or worse, the learning has not shown a reliable improvement in this test.")
+        elif not saved_holdout:
+            st.caption("Run this check after the universe has enough saved history. It uses a time split and does not train on the later holdout outcomes.")
+        else:
+            st.caption("The selected universe, spacing, or threshold changed. Run the holdout check again for the current selection.")
     else:
         st.info("Run the next download batch. Each share's maximum available daily history is cached locally, and completed historical observations are added to the learning pool.")
     con=db_connect()

@@ -11,6 +11,7 @@ PHASE 4 HISTORICAL LEARNING
 - Phase 4 adds daily range, close position in the daily range, opening gap, and 20-day volatility to Phase 3 momentum, trend and volume factors. Early-Mover scores display observed factors, weights, contributions, and technical risks.
 - Historical completed outcomes combine with completed live predictions to adapt future Early-Mover weights after at least 30 learning observations. The learning pool samples about one signal per ticker per calendar month to limit the effect of overlapping 20-day returns.
 - Dashboard tables use a representative sample (up to about 30 rows per share) to keep memory use manageable. Full downloaded OHLCV and evaluation rows remain in SQLite. CSV export from the dashboard is the displayed sample.
+- Use **Run learned-versus-fixed holdout check** to compare the adaptive weights with original weights. It trains on earlier matured observations, leaves a 45-calendar-day gap, and evaluates the later portion of the displayed historical sample. Better returns and fewer false positives on that holdout are evidence the learned weights helped in that sample; mixed or worse results are evidence they did not. Neither result guarantees what happens in future markets.
 
 INSTALL / UPDATE
 1. Download and extract `asx_phase4_replacement.zip`.
@@ -19,7 +20,7 @@ INSTALL / UPDATE
 4. Commit the replacements and wait for Streamlit to redeploy.
 5. Open Phase 4 Backtest, select Entire listed universe, keep 5-day spacing initially, and use a cautious batch size such as 20.
 6. Click **Run all remaining batches automatically** once. It processes shares in groups of 20 by default and updates progress as it goes. Larger groups finish with fewer requests but may be more likely to be throttled. If the app stops or times out, progress is saved after each completed batch; reopen the page and click the button again to resume. Avoid changing the universe or spacing mid-run. A failed code is listed; Restart this backtest run retries the universe.
-7. Review unavailable codes and the learning status in Prediction Lab. Back up both prediction-history CSV and `asx_prediction_history.sqlite` regularly; Streamlit local storage can reset after redeployment.
+7. Review the attempted count, cached ticker coverage, unavailable-code list, and the historical monthly examples in Prediction Lab. The weights table shows each learned weight beside its original value and the size of the change. Back up both prediction-history CSV and `asx_prediction_history.sqlite` regularly; Streamlit local storage can reset after redeployment.
 
 DATABASE BACKUP BUTTON
 In the updated app, open Prediction Lab or Phase 4 Backtest, click **Prepare SQLite database backup**, then click **Download SQLite backup**. Save the resulting `.sqlite` file somewhere outside the repository. It includes saved predictions, download progress, cached OHLCV and historical outcomes. The existing older deployment does not have this button until the updated `app.py` is deployed. If it contains prediction data, first download the existing Prediction Lab CSV and check GitHub for an already-committed `asx_prediction_history.sqlite` before redeploying; a server-local database may not survive a redeploy.
