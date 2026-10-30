@@ -428,10 +428,53 @@ def refresh_prediction_outcomes():
         progress.progress((n+1)/len(pending),text=f"Checking prediction {n+1}/{len(pending)}…")
     progress.empty(); return updated
 
+def historical_backtest_frame(hist, ticker, interval=5):
+    """Create a simple historical walk-forward sample using only trailing data at each date."""
+    if hist is None or hist.empty or "Close" not in hist:
+        return pd.DataFrame()
+    close = hist["Close"].dropna().astype(float)
+    volume = hist["Volume"].fillna(0).astype(float) if "Volume" in hist else pd.Series(0.0, index=close.index)
+    horizons = (5, 10, 20, 30)
+    rows = []
+    # 200 sessions of prior context are required for the long-trend indicator.
+    for i in range(200, len(close) - max(horizons), interval):
+        past = close.iloc[:i+1]
+        vpast = volume.reindex(past.index).fillna(0)
+        price = float(past.iloc[-1])
+        ma50 = float(past.tail(50).mean())
+        ma200 = float(past.tail(200).mean())
+        v20 = float(vpast.tail(20).mean())
+        vprev = float(vpast.iloc[-40:-20].mean()) if len(vpast) >= 40 else 0.0
+        row = {
+            "Return 1W %": pct(past, 5), "Return 1M %": pct(past, 21),
+            "Return 3M %": pct(past, 63), "Price vs 50D %": (price/ma50-1)*100 if ma50 else np.nan,
+            "Above 200D %": (price/ma200-1)*100 if ma200 else np.nan,
+            "Volume Change %": (v20/vprev-1)*100 if vprev else np.nan,
+            "Distance from 20D High %": (price/float(past.tail(20).max())-1)*100 if len(past)>=20 else np.nan,
+            "Ticker": ticker, "Signal date": str(past.index[-1])[:10], "Entry price": price,
+        }
+        row["Score"] = score_with_weights(row, BASE_WEIGHTS)
+        for horizon in horizons:
+            future = float(close.iloc[i+horizon])
+            row[f"Return {horizon}d %"] = (future/price-1)*100
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+def backtest_metrics(frame, horizon):
+    col = f"Return {horizon}d %"
+    values = pd.to_numeric(frame[col], errors="coerce").dropna()
+    return {
+        "Signals": len(values),
+        "Positive return %": (values.gt(0).mean()*100) if len(values) else np.nan,
+        "Average return %": values.mean() if len(values) else np.nan,
+        "Median return %": values.median() if len(values) else np.nan,
+        "Negative return %": values.lt(0).mean()*100 if len(values) else np.nan,
+    }
+
 
 MASTER_TICKERS = load_master_tickers()
 with st.sidebar:
-    page=st.radio("Page",["Single-Share Analysis","Automatic Share Scanner","Early-Mover Tracker","Prediction Lab","Lower-Risk Investing","Value Investing","Momentum Trading","High-Growth Shares","Long-Term Investing","Portfolio Planner"])
+    page=st.radio("Page",["Single-Share Analysis","Automatic Share Scanner","Early-Mover Tracker","Prediction Lab","Phase 4 Backtest","Lower-Risk Investing","Value Investing","Momentum Trading","High-Growth Shares","Long-Term Investing","Portfolio Planner"])
     st.divider()
     ticker_text=st.text_area("ASX tickers (commas or new lines)",", ".join(MASTER_TICKERS),height=160,
         help="Defaults to the bundled ASX company list. Edit or paste your own tickers if needed.")
@@ -773,6 +816,76 @@ elif page=="Prediction Lab":
                 con=db_connect(); con.execute("DELETE FROM predictions"); con.commit(); con.close()
                 st.session_state["confirm_delete_predictions"]=False; st.rerun()
     st.caption(f"Local database: {DB_PATH.name}. Streamlit Community Cloud local storage may be reset by app rebuilds or restarts. Download the CSV backup regularly; a later upgrade can connect durable cloud storage.")
+
+elif page=="Phase 4 Backtest":
+    st.header("🧪 Phase 4 — Historical Backtest & Diagnostics")
+    st.write("Replay the Phase 3 Early-Mover scoring rules at past dates, then compare each score with later price changes. This is separate from the live predictions saved in Prediction Lab.")
+    st.warning("Historical test uses the original fixed weights, trailing price data only, and the current ticker list. It excludes delisted companies, fees, spreads, dividends and market impact; survivorship bias and small samples can materially distort results. A score is not a probability or a forecast.")
+    backtest_codes=st.multiselect("Select shares for historical test",MASTER_TICKERS,default=MASTER_TICKERS[:min(8,len(MASTER_TICKERS))],key="p4_backtest_codes")
+    interval=st.select_slider("Signal spacing (trading days)",[1,5,10,20],value=5,key="p4_interval")
+    signal_threshold=st.slider("Score treated as a signal",40,90,65,key="p4_threshold")
+    if st.button("Run historical backtest",type="primary",key="p4_run"):
+        if not backtest_codes:
+            st.warning("Select at least one share.")
+        else:
+            assembled=[]; failed=[]
+            progress=st.progress(0,text="Downloading historical share prices…")
+            price_sets=download_price_batches(backtest_codes,"5y",batch_size=30)
+            for idx,ticker in enumerate(backtest_codes):
+                try:
+                    one=historical_backtest_frame(price_sets.get(ticker,pd.DataFrame()),ticker,int(interval))
+                    if one.empty: failed.append({"Ticker":ticker,"Reason":"Insufficient or unavailable 5-year price history."})
+                    else: assembled.append(one)
+                except Exception as exc:
+                    failed.append({"Ticker":ticker,"Reason":str(exc)[:200]})
+                progress.progress((idx+1)/len(backtest_codes),text=f"Evaluating {ticker} ({idx+1}/{len(backtest_codes)})…")
+            progress.empty()
+            st.session_state["p4_backtest"] = pd.concat(assembled,ignore_index=True) if assembled else pd.DataFrame()
+            st.session_state["p4_backtest_failures"] = failed
+            st.session_state["p4_backtest_threshold"] = signal_threshold
+    bt=st.session_state.get("p4_backtest",pd.DataFrame())
+    if not bt.empty:
+        cutoff=st.session_state.get("p4_backtest_threshold",signal_threshold)
+        signals=bt[pd.to_numeric(bt["Score"],errors="coerce")>=cutoff].copy()
+        st.caption(f"{len(bt):,} historical observations; {len(signals):,} met the saved signal threshold of {cutoff}. Scores use fixed original weights to avoid using today's learned weights against old data.")
+        st.subheader("Accuracy by timeframe")
+        horizon_rows=[]
+        for horizon in (5,10,20,30):
+            metrics=backtest_metrics(signals,horizon)
+            horizon_rows.append({"Timeframe (trading days)":horizon,**{k:(round(v,2) if pd.notna(v) and isinstance(v,(int,float,np.integer,np.floating)) else v) for k,v in metrics.items()}})
+        st.dataframe(pd.DataFrame(horizon_rows),use_container_width=True,hide_index=True)
+        horizon=st.selectbox("Diagnostic timeframe",[5,10,20,30],index=2,key="p4_horizon")
+        retcol=f"Return {horizon}d %"
+        st.subheader("Calibration by score bucket")
+        work=bt.copy()
+        work["Score bucket"]=pd.cut(pd.to_numeric(work["Score"],errors="coerce"),[-np.inf,49,64,79,np.inf],labels=["0–49","50–64","65–79","80–100"])
+        bucket=work.groupby("Score bucket",observed=False).agg(
+            Samples=(retcol,"count"),Positive_return_rate=(retcol,lambda x:round((x>0).mean()*100,1)),
+            Mean_return=(retcol,"mean"),Median_return=(retcol,"median"),False_positive_rate=(retcol,lambda x:round((x<0).mean()*100,1))).reset_index()
+        bucket.columns=["Score bucket","Samples","Positive return %","Average return %","Median return %","False positive %"]
+        st.dataframe(bucket.round(2),use_container_width=True,hide_index=True)
+        st.caption("A false positive is a score at or above the selected threshold followed by a negative return at the chosen timeframe. Calibration is descriptive: score bands are not probabilities.")
+        st.subheader("What went wrong or right?")
+        st.write("**False positives / weakest signal outcomes**")
+        st.dataframe(signals.sort_values(retcol).head(12)[["Ticker","Signal date","Score","Entry price",retcol]],use_container_width=True,hide_index=True)
+        st.write("**Best signal outcomes**")
+        st.dataframe(signals.sort_values(retcol,ascending=False).head(12)[["Ticker","Signal date","Score","Entry price",retcol]],use_container_width=True,hide_index=True)
+        st.subheader("Indicator diagnostics")
+        st.caption("These correlations compare trailing indicator values with the selected forward return in this sample. They are exploratory and do not establish cause.")
+        diagnostics=[]
+        for feature in FEATURES:
+            if feature in work:
+                pair=work[[feature,retcol]].apply(pd.to_numeric,errors="coerce").dropna()
+                corr=pair.iloc[:,0].corr(pair.iloc[:,1]) if len(pair)>=10 and pair.iloc[:,0].nunique()>1 else np.nan
+                diagnostics.append({"Indicator":feature,"Sample count":len(pair),"Correlation with forward return":corr})
+        st.dataframe(pd.DataFrame(diagnostics).round(3),use_container_width=True,hide_index=True)
+        st.download_button("Download historical backtest CSV",bt.to_csv(index=False).encode(),file_name="asx_phase4_historical_backtest.csv",mime="text/csv")
+    else:
+        st.info("Choose a manageable sample and run the historical test. Five years of price history are needed for the 200-day trend indicator.")
+    failures=st.session_state.get("p4_backtest_failures",[])
+    if failures:
+        with st.expander(f"Unavailable shares ({len(failures)})"):
+            st.dataframe(pd.DataFrame(failures),use_container_width=True,hide_index=True)
 
 elif page=="Lower-Risk Investing":
     st.header(page); show_scan("Lower-Risk Score","A relative screen for shares above their 200-day average and without a severe monthly decline. These are not guaranteed to be safe.")
