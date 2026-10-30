@@ -239,6 +239,37 @@ def download_price_batches(tickers, period, batch_size=30):
     return output
 
 
+def refresh_vpa_results(frame, period="1y"):
+    """Backfill VPA from OHLCV without rerunning fundamentals or losing prior scores."""
+    updated = frame.copy()
+    fields = ["VPA Score", "Accumulation Score", "Distribution Risk",
+              "Effort Result Score", "VPA Signal", "VPA Notes"]
+    for field in fields:
+        if field not in updated.columns:
+            updated[field] = np.nan if field.endswith("Score") or field == "Distribution Risk" else ""
+    symbols = updated.loc[updated["Price"].notna(), "Ticker"].astype(str).tolist()
+    bar = st.progress(0, text="Downloading OHLCV data for VPA…")
+    for offset in range(0, len(symbols), 30):
+        batch = symbols[offset:offset + 30]
+        histories = download_price_batches(batch, period, batch_size=30)
+        for symbol in batch:
+            history = histories.get(symbol, pd.DataFrame())
+            try:
+                result = calculate_vpa(history)
+            except Exception as exc:
+                result = {"VPA Score": np.nan, "Accumulation Score": np.nan,
+                          "Distribution Risk": np.nan, "Effort Result Score": np.nan,
+                          "VPA Signal": "VPA calculation error",
+                          "VPA Notes": f"{type(exc).__name__}: {str(exc)[:150]}"}
+            mask = updated["Ticker"].astype(str).eq(symbol)
+            for field, value in result.items():
+                updated.loc[mask, field] = value
+        bar.progress(min(1.0, (offset + len(batch)) / max(len(symbols), 1)),
+                     text=f"Calculated VPA for {min(offset+len(batch),len(symbols))}/{len(symbols)} tickers")
+    bar.empty()
+    return updated
+
+
 def calculate_vpa(history):
     """Rule-based Volume Price Analysis signals from daily OHLCV data.
 
@@ -248,7 +279,7 @@ def calculate_vpa(history):
     empty = {
         "VPA Score": np.nan, "Accumulation Score": np.nan,
         "Distribution Risk": np.nan, "Effort Result Score": np.nan,
-        "VPA Signal": "Insufficient OHLCV data", "VPA Notes": ""
+        "VPA Signal": "Insufficient OHLCV data", "VPA Notes": "Fewer than 30 usable OHLCV sessions; check Yahoo history, OHLC columns and trading volume."
     }
     if history is None or history.empty or len(history) < 30:
         return empty
@@ -572,6 +603,14 @@ with st.sidebar:
                 if "Price" in kept_df.columns:
                     kept_df = kept_df[kept_df["Price"].notna()].copy()
                 already_done = set(kept_df["Ticker"].astype(str))
+                # Older Phase 3 rows have prices but no VPA columns. Do not silently
+                # treat those rows as Phase 5-complete results.
+                if "VPA Score" not in kept_df.columns:
+                    already_done = set()
+                else:
+                    missing_vpa = set(kept_df.loc[kept_df["VPA Score"].isna(), "Ticker"].astype(str))
+                    already_done -= missing_vpa
+                kept_df = kept_df[kept_df["Ticker"].astype(str).isin(already_done)]
                 to_scan = [sym for sym in tickers if sym not in already_done]
             else:
                 kept_df = pd.DataFrame()
@@ -820,6 +859,15 @@ elif page=="VPA Scanner":
     if scan.empty:
         st.info("Run a full-market or quick promising-shares scan first. VPA uses the same downloaded price history.")
     else:
+        missing_count = (int(scan["Price"].notna().sum()) if "VPA Score" not in scan.columns
+                         else int((scan["Price"].notna() & scan["VPA Score"].isna()).sum()))
+        if missing_count:
+            st.warning(f"{missing_count} tickers have prices but no VPA score. These may be reused Phase 3 results. You can repair VPA without rescanning fundamentals.")
+            if st.button("Calculate / repair missing VPA scores", type="primary"):
+                with st.spinner("Refreshing VPA from historical prices and volume…"):
+                    repaired = refresh_vpa_results(scan, st.session_state.get("scan_period", "1y"))
+                    st.session_state["scan_results"] = repaired
+                st.rerun()
         vpa=scan[scan["Price"].notna()].copy()
         # Backward compatibility: cached/session scan results from Phase 3 or
         # earlier Phase 5 builds may not contain the newer VPA columns.

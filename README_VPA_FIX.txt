@@ -1,0 +1,1 @@
+Replace only your GitHub app.py with the included app.py. Keep all other files and your prediction history. Open VPA Scanner and click Calculate / repair missing VPA scores. This downloads OHLCV in batches without repeating fundamental requests. Some tickers may legitimately lack data. Do not delete your database.
