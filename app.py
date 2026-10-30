@@ -7,6 +7,7 @@ import time
 import sqlite3
 import json
 import hashlib
+import tempfile
 from pathlib import Path
 
 st.set_page_config(page_title="ASX Share Analyser", page_icon="📈", layout="wide")
@@ -386,6 +387,44 @@ def db_connect():
     con.commit()
     return con
 
+def sqlite_backup_bytes():
+    """Create a consistent SQLite snapshot, including committed WAL data, for download."""
+    if not DB_PATH.exists():
+        return None
+    with tempfile.TemporaryDirectory() as folder:
+        backup_path=Path(folder)/"asx_prediction_history.sqlite"
+        source=sqlite3.connect(str(DB_PATH),timeout=30)
+        target=sqlite3.connect(str(backup_path),timeout=30)
+        try:
+            source.backup(target)
+        finally:
+            target.close(); source.close()
+        return backup_path.read_bytes()
+
+def render_database_backup(key_prefix):
+    st.caption("This backup contains the saved prediction database, batch progress, cached historical OHLCV prices, and learning outcomes.")
+    if st.button("Prepare SQLite database backup",key=f"{key_prefix}_prepare_db_backup"):
+        try:
+            st.session_state["sqlite_backup_bytes"]=sqlite_backup_bytes()
+            st.session_state["sqlite_backup_filename"]=f"asx_prediction_history_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.sqlite"
+        except Exception as exc:
+            st.error(f"Could not prepare the database backup: {exc}")
+    backup=st.session_state.get("sqlite_backup_bytes")
+    if backup:
+        st.download_button("Download SQLite backup",data=backup,file_name=st.session_state.get("sqlite_backup_filename","asx_prediction_history_backup.sqlite"),mime="application/vnd.sqlite3",key=f"{key_prefix}_download_db_backup")
+
+def render_database_backup(key_prefix):
+    st.caption("This backup contains the saved prediction database, batch progress, cached historical OHLCV prices, and learning outcomes.")
+    if st.button("Prepare SQLite database backup",key=f"{key_prefix}_prepare_db_backup"):
+        try:
+            st.session_state["sqlite_backup_bytes"]=sqlite_backup_bytes()
+            st.session_state["sqlite_backup_filename"]=f"asx_prediction_history_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.sqlite"
+        except Exception as exc:
+            st.error(f"Could not prepare the database backup: {exc}")
+    backup=st.session_state.get("sqlite_backup_bytes")
+    if backup:
+        st.download_button("Download SQLite backup",data=backup,file_name=st.session_state.get("sqlite_backup_filename","asx_prediction_history_backup.sqlite"),mime="application/vnd.sqlite3",key=f"{key_prefix}_download_db_backup")
+
 def component_scores(row):
     def val(k):
         x=num(row.get(k)); return x if x is not None and np.isfinite(x) else None
@@ -578,6 +617,37 @@ def load_historical_prices(ticker):
     if frame.empty: return frame
     frame["Date"]=pd.to_datetime(frame["Date"])
     return frame.set_index("Date")
+
+def process_historical_batch(batch_codes, job_key, interval, batch_number=None, batch_total=None):
+    """Download, cache, evaluate, and checkpoint one small group of tickers."""
+    failures=[]
+    label=f"Downloading maximum available history for batch {batch_number}/{batch_total}…" if batch_number is not None else "Downloading maximum available history…"
+    progress=st.progress(0,text=label)
+    price_sets=download_price_batches(batch_codes,"max",batch_size=30)
+    for idx,ticker in enumerate(batch_codes):
+        try:
+            prices=price_sets.get(ticker,pd.DataFrame())
+            if prices is not None and not prices.empty:
+                save_historical_prices(ticker,prices)
+            else:
+                prices=load_historical_prices(ticker)
+            one=historical_backtest_frame(prices,ticker,int(interval))
+            if one.empty:
+                failures.append({"Ticker":ticker,"Reason":"No cached or online history long enough to calculate the 200-day trend and later outcomes."})
+            else:
+                store_historical_learning(one)
+        except Exception as exc:
+            failures.append({"Ticker":ticker,"Reason":str(exc)[:200]})
+        con=db_connect()
+        failure=next((item["Reason"] for item in failures if item["Ticker"]==ticker),None)
+        if failure:
+            con.execute("INSERT OR REPLACE INTO historical_batch_failures (job_key,ticker,reason,updated_at) VALUES (?,?,?,?)",(job_key,ticker,failure,datetime.now().isoformat(timespec="seconds")))
+        else:
+            con.execute("DELETE FROM historical_batch_failures WHERE job_key=? AND ticker=?",(job_key,ticker))
+        con.commit(); con.close()
+        progress.progress((idx+1)/max(1,len(batch_codes)),text=f"Processed {ticker} ({idx+1}/{len(batch_codes)} in batch)…")
+    progress.empty()
+    return failures
 
 def load_historical_learning(tickers):
     """Load a representative display sample; all rows remain stored and feed training."""
@@ -1035,6 +1105,7 @@ elif page=="Prediction Lab":
                 con=db_connect(); con.execute("DELETE FROM predictions"); con.commit(); con.close()
                 st.session_state["confirm_delete_predictions"]=False; st.rerun()
     st.caption(f"Local database: {DB_PATH.name}. Streamlit Community Cloud local storage may be reset by app rebuilds or restarts. Download the CSV backup regularly; a later upgrade can connect durable cloud storage.")
+    render_database_backup("prediction_lab")
 
 elif page=="Phase 4 Backtest":
     st.header("🧪 Phase 4 — Historical Backtest & Diagnostics")
@@ -1056,41 +1127,36 @@ elif page=="Phase 4 Backtest":
     cached_tickers,cached_rows=con.execute("SELECT COUNT(DISTINCT ticker),COUNT(*) FROM historical_prices").fetchone()
     con.close()
     st.caption(f"Local cache currently holds {cached_rows:,} daily OHLCV records across {cached_tickers:,} tickers. Completed batches and learning observations remain in the app's SQLite database between reruns; back up that database before replacing or migrating the app.")
-    col_run,col_reset=st.columns(2)
-    run_batch=col_run.button(f"Run next batch ({min(batch_size,max(0,len(backtest_codes)-done))} shares)",type="primary",key="p4_run_batch",disabled=(done>=len(backtest_codes) or not backtest_codes))
+    col_auto,col_single,col_reset=st.columns(3)
+    run_all=col_auto.button("Run all remaining batches automatically",type="primary",key="p4_run_all",disabled=(done>=len(backtest_codes) or not backtest_codes))
+    run_batch=col_single.button(f"Run one batch ({min(batch_size,max(0,len(backtest_codes)-done))})",key="p4_run_batch",disabled=(done>=len(backtest_codes) or not backtest_codes))
     reset_batch=col_reset.button("Restart this backtest run",key="p4_reset_batch",disabled=(done==0))
+    st.caption("The automatic run may take a long time. Progress and data are saved after each batch; if Streamlit interrupts it, return here and click the automatic button again to resume.")
     if reset_batch:
         set_batch_job_index(job_key,backtest_codes,interval,0)
         st.rerun()
-    if run_batch:
+    if run_all:
+        current=done
+        batch_total=int(np.ceil((len(backtest_codes)-current)/batch_size))
+        overall=st.progress(0,text=f"Starting {batch_total} remaining batches…")
+        failed_codes=[]; batch_number=0
+        while current<len(backtest_codes):
+            batch_number+=1
+            batch_codes=backtest_codes[current:min(current+batch_size,len(backtest_codes))]
+            failed_codes.extend(process_historical_batch(batch_codes,job_key,interval,batch_number,batch_total))
+            current=min(current+len(batch_codes),len(backtest_codes))
+            set_batch_job_index(job_key,backtest_codes,interval,current)
+            overall.progress(current/max(1,len(backtest_codes)),text=f"Completed {current:,} of {len(backtest_codes):,} shares")
+        overall.empty()
+        st.session_state["p4_backtest_threshold"]=signal_threshold
+        st.success(f"Finished the full run. {len(failed_codes)} ticker(s) had unavailable or insufficient history; see the failed-share list below.")
+        st.rerun()
+    elif run_batch:
         batch_codes=backtest_codes[done:min(done+batch_size,len(backtest_codes))]
-        failures=[]; progress=st.progress(0,text="Downloading maximum available history…")
-        price_sets=download_price_batches(batch_codes,"max",batch_size=30)
-        for idx,ticker in enumerate(batch_codes):
-            try:
-                prices=price_sets.get(ticker,pd.DataFrame())
-                if prices is not None and not prices.empty:
-                    save_historical_prices(ticker,prices)
-                else:
-                    prices=load_historical_prices(ticker)
-                one=historical_backtest_frame(prices,ticker,int(interval))
-                if one.empty: failures.append({"Ticker":ticker,"Reason":"No cached or online history long enough to calculate the 200-day trend and later outcomes."})
-                else: store_historical_learning(one)
-            except Exception as exc:
-                failures.append({"Ticker":ticker,"Reason":str(exc)[:200]})
-            con=db_connect()
-            if any(item["Ticker"]==ticker for item in failures):
-                reason=next(item["Reason"] for item in failures if item["Ticker"]==ticker)
-                con.execute("INSERT OR REPLACE INTO historical_batch_failures (job_key,ticker,reason,updated_at) VALUES (?,?,?,?)",(job_key,ticker,reason,datetime.now().isoformat(timespec="seconds")))
-            else:
-                con.execute("DELETE FROM historical_batch_failures WHERE job_key=? AND ticker=?",(job_key,ticker))
-            con.commit(); con.close()
-            progress.progress((idx+1)/max(1,len(batch_codes)),text=f"Processed {ticker} ({idx+1}/{len(batch_codes)} in this batch)…")
-        progress.empty()
+        process_historical_batch(batch_codes,job_key,interval)
         next_index=min(done+len(batch_codes),len(backtest_codes))
         set_batch_job_index(job_key,backtest_codes,interval,next_index)
         st.session_state["p4_backtest_threshold"]=signal_threshold
-        st.session_state["p4_new_training_rows"]=load_historical_learning(batch_codes).shape[0]
         st.rerun()
     bt=load_historical_learning(backtest_codes)
     if not bt.empty:
@@ -1140,6 +1206,7 @@ elif page=="Phase 4 Backtest":
     if failures:
         with st.expander(f"Unavailable shares ({len(failures)})"):
             st.dataframe(pd.DataFrame(failures),use_container_width=True,hide_index=True)
+    render_database_backup("phase4_backtest")
 
 elif page=="Lower-Risk Investing":
     st.header(page); show_scan("Lower-Risk Score","A relative screen for shares above their 200-day average and without a severe monthly decline. These are not guaranteed to be safe.")
