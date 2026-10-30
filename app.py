@@ -5,6 +5,8 @@ import numpy as np
 from datetime import datetime
 import time
 from pathlib import Path
+import sqlite3
+import json
 
 st.set_page_config(page_title="ASX Share Analyser", page_icon="📈", layout="wide")
 st.title("📈 ASX Share Analyser")
@@ -313,9 +315,211 @@ def run_scan(tickers, period):
         return df
     return pd.concat([df, df.apply(score_row, axis=1)], axis=1)
 
+
+# ---------------------------------------------------------------------------
+# Prediction history: snapshots are saved separately from the live scan cache.
+# SQLite is convenient for this prototype; Streamlit Cloud storage is not a
+# guaranteed permanent database, so export backups from the Performance page.
+# ---------------------------------------------------------------------------
+DB_PATH = Path(__file__).with_name("prediction_history.db")
+PREDICTION_MODEL_VERSION = "v1"
+
+def db_connect():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_prediction_db():
+    with db_connect() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS predictions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker TEXT NOT NULL,
+                prediction_type TEXT NOT NULL,
+                model_version TEXT NOT NULL,
+                prediction_date TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                price REAL,
+                overall_score REAL,
+                momentum_score REAL,
+                value_score REAL,
+                growth_score REAL,
+                early_mover_score REAL,
+                return_1w REAL,
+                return_1m REAL,
+                return_3m REAL,
+                price_vs_50d REAL,
+                above_200d REAL,
+                volume_change REAL,
+                distance_20d_high REAL,
+                outcome_5d REAL,
+                outcome_20d REAL,
+                outcome_60d REAL,
+                UNIQUE(ticker, prediction_type, model_version, prediction_date)
+            )
+        """)
+        conn.commit()
+
+def record_prediction_snapshots(frame):
+    if frame is None or frame.empty or "Ticker" not in frame.columns:
+        return 0
+    init_prediction_db()
+    saved = 0
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with db_connect() as conn:
+        for _, row in frame.iterrows():
+            price = num(row.get("Price"))
+            date_value = str(row.get("Data Date", "") or "")
+            if price is None or not date_value:
+                continue
+            early = early_mover_score(row)
+            common = (
+                str(row.get("Ticker", "")).upper(), PREDICTION_MODEL_VERSION,
+                date_value, now, price, num(row.get("Overall Score")),
+                num(row.get("Momentum Score")), num(row.get("Value Score")),
+                num(row.get("Growth Score")), num(early),
+                num(row.get("Return 1W %")), num(row.get("Return 1M %")),
+                num(row.get("Return 3M %")), num(row.get("Price vs 50D %")),
+                num(row.get("Above 200D %")), num(row.get("Volume Change %")),
+                num(row.get("Distance from 20D High %"))
+            )
+            for prediction_type in ("Overall", "Early-Mover"):
+                cur = conn.execute("""
+                    INSERT OR IGNORE INTO predictions
+                    (ticker, prediction_type, model_version, prediction_date, recorded_at,
+                     price, overall_score, momentum_score, value_score, growth_score,
+                     early_mover_score, return_1w, return_1m, return_3m, price_vs_50d,
+                     above_200d, volume_change, distance_20d_high)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (common[0], prediction_type, *common[1:]))
+                saved += cur.rowcount
+        conn.commit()
+    return saved
+
+def read_prediction_history():
+    init_prediction_db()
+    with db_connect() as conn:
+        return pd.read_sql_query("SELECT * FROM predictions ORDER BY prediction_date DESC, ticker", conn)
+
+def update_prediction_outcomes():
+    history = read_prediction_history()
+    if history.empty:
+        return 0, 0
+    pending = history[
+        history[["outcome_5d", "outcome_20d", "outcome_60d"]].isna().any(axis=1)
+    ]
+    if pending.empty:
+        return 0, 0
+    symbols = sorted(pending["ticker"].dropna().astype(str).unique().tolist())
+    price_map = download_price_batches(symbols, "2y", batch_size=30)
+    updated = checked = 0
+    with db_connect() as conn:
+        for _, prediction in pending.iterrows():
+            hist = price_map.get(prediction["ticker"], pd.DataFrame())
+            if hist is None or hist.empty or "Close" not in hist:
+                continue
+            checked += 1
+            dates = pd.to_datetime(hist.index)
+            future = hist.loc[dates.strftime("%Y-%m-%d") > str(prediction["prediction_date"]), "Close"].dropna()
+            if future.empty:
+                continue
+            values = {}
+            for horizon in (5, 20, 60):
+                col = f"outcome_{horizon}d"
+                if pd.isna(prediction[col]) and len(future) >= horizon:
+                    future_price = num(future.iloc[horizon - 1])
+                    start_price = num(prediction["price"])
+                    if start_price not in (None, 0) and future_price is not None:
+                        values[col] = (future_price / start_price - 1) * 100
+            if values:
+                assignments = ", ".join(f"{key}=?" for key in values)
+                conn.execute(
+                    f"UPDATE predictions SET {assignments} WHERE id=?",
+                    (*values.values(), int(prediction["id"]))
+                )
+                updated += 1
+        conn.commit()
+    return updated, checked
+
+def prediction_performance_page():
+    st.header("Prediction Performance & Learning")
+    st.write("This page checks recorded scanner signals against subsequent share prices. It measures historical outcomes; it does not prove that the signals will work in future.")
+    history = read_prediction_history()
+    if history.empty:
+        st.info("No prediction history has been recorded yet. Run a scan after installing this version; each ticker/date will be recorded once for both Overall and Early-Mover rankings.")
+        return
+
+    st.caption(f"Recorded predictions: {len(history):,} | First recorded date: {history['prediction_date'].min()} | Latest: {history['prediction_date'].max()}")
+    if st.button("Update prediction outcomes", type="primary"):
+        with st.spinner("Checking subsequent ASX share prices…"):
+            updated, checked = update_prediction_outcomes()
+        st.success(f"Checked {checked} prediction records and updated {updated}.")
+        history = read_prediction_history()
+
+    type_choice = st.selectbox("Prediction model", ["Early-Mover", "Overall"])
+    data = history[history["prediction_type"] == type_choice].copy()
+    st.subheader("Performance by timeframe")
+    metric_cols = st.columns(3)
+    for col, horizon in zip(metric_cols, (5, 20, 60)):
+        outcome = data[f"outcome_{horizon}d"].dropna()
+        col.metric(f"{horizon}-trading-day win rate", f"{(outcome > 0).mean()*100:.1f}%" if len(outcome) else "Pending")
+        col.caption(f"{len(outcome)} evaluated")
+    summary_rows = []
+    for horizon in (5, 20, 60):
+        outcome = data[f"outcome_{horizon}d"].dropna()
+        summary_rows.append({
+            "Horizon": f"{horizon} trading days",
+            "Evaluated": len(outcome),
+            "Positive outcomes": int((outcome > 0).sum()),
+            "Win rate %": round((outcome > 0).mean()*100, 1) if len(outcome) else np.nan,
+            "Average return %": round(outcome.mean(), 2) if len(outcome) else np.nan,
+            "Median return %": round(outcome.median(), 2) if len(outcome) else np.nan,
+            "20%+ rises": int((outcome >= 20).sum()) if len(outcome) else 0,
+            "10%+ falls": int((outcome <= -10).sum()) if len(outcome) else 0
+        })
+    st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
+
+    st.subheader("Which signals worked better?")
+    evaluated = data[data["outcome_20d"].notna()].copy()
+    if len(evaluated) >= 5:
+        diagnostics = []
+        for label, field, condition in [
+            ("1-week return positive", "return_1w", lambda s: s > 0),
+            ("1-month return positive", "return_1m", lambda s: s > 0),
+            ("Above 50-day average", "price_vs_50d", lambda s: s > 0),
+            ("Above 200-day average", "above_200d", lambda s: s > 0),
+            ("Volume expanding", "volume_change", lambda s: s > 0),
+            ("Within 2% of 20-day high", "distance_20d_high", lambda s: s >= -2)
+        ]:
+            valid = evaluated.dropna(subset=[field, "outcome_20d"])
+            for group_name, mask in [("Signal present", condition(valid[field])), ("Signal absent", ~condition(valid[field]))]:
+                subset = valid[mask]
+                if len(subset):
+                    diagnostics.append({
+                        "Indicator": label, "Group": group_name, "Samples": len(subset),
+                        "20-day win rate %": round((subset["outcome_20d"] > 0).mean()*100, 1),
+                        "Average 20-day return %": round(subset["outcome_20d"].mean(), 2)
+                    })
+        if diagnostics:
+            st.dataframe(pd.DataFrame(diagnostics), hide_index=True, use_container_width=True)
+            st.caption("Descriptive comparisons only. These indicators overlap and are not causal proof. Treat small sample sizes cautiously.")
+    else:
+        st.info("At least five evaluated 20-day outcomes are needed before the indicator comparison becomes useful.")
+
+    st.subheader("Prediction history")
+    display_cols = ["ticker", "prediction_type", "prediction_date", "price", "overall_score", "early_mover_score", "outcome_5d", "outcome_20d", "outcome_60d"]
+    st.dataframe(data[display_cols].round(2), use_container_width=True, hide_index=True)
+    st.download_button(
+        "Download prediction history backup (CSV)",
+        history.to_csv(index=False).encode("utf-8"),
+        file_name="asx_prediction_history_backup.csv",
+        mime="text/csv"
+    )
+    st.warning("Storage note: this prototype uses a local SQLite database beside app.py. Streamlit Community Cloud can reset local files during restarts or redeployments. Download the CSV backup regularly; for dependable long-term cloud history, the next step is connecting a persistent database.")
+
 MASTER_TICKERS = load_master_tickers()
 with st.sidebar:
-    page=st.radio("Page",["Single-Share Analysis","Automatic Share Scanner","Early-Mover Tracker","Lower-Risk Investing","Value Investing","Momentum Trading","High-Growth Shares","Long-Term Investing","Portfolio Planner"])
+    page=st.radio("Page",["Single-Share Analysis","Automatic Share Scanner","Early-Mover Tracker","Lower-Risk Investing","Value Investing","Momentum Trading","High-Growth Shares","Long-Term Investing","Portfolio Planner","Prediction Performance"])
     st.divider()
     ticker_text=st.text_area("ASX tickers (commas or new lines)",", ".join(MASTER_TICKERS),height=160,
         help="Defaults to the bundled ASX company list. Edit or paste your own tickers if needed.")
@@ -391,6 +595,8 @@ with st.sidebar:
                     combined = combined.sort_values("_order").drop(columns="_order").reset_index(drop=True)
 
                 st.session_state["scan_results"] = combined
+                recorded_count = record_prediction_snapshots(combined)
+                st.session_state["last_prediction_record_count"] = recorded_count
                 st.session_state["scan_period"] = scan_period
                 st.session_state["scan_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 st.session_state["scan_report"] = {
@@ -623,6 +829,9 @@ elif page=="Portfolio Planner":
         st.download_button("Download portfolio plan CSV",plan.to_csv(index=False).encode(),file_name="portfolio_plan.csv",mime="text/csv")
     else: st.warning("Adjust the sliders until the allocation totals 100%.")
     st.info("Diversification does not eliminate risk. Consider fees, tax, emergency savings, time horizon and the possibility of loss.")
+
+elif page=="Prediction Performance":
+    prediction_performance_page()
 
 st.divider()
 st.subheader("Data and limitations")
