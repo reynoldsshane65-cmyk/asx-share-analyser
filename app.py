@@ -329,9 +329,22 @@ def db_connect():
         signal_date TEXT NOT NULL, entry_price REAL NOT NULL, base_score REAL,
         components_json TEXT, features_json TEXT, weights_json TEXT,
         price_5d REAL, return_5d REAL, checked_5d TEXT,
+        price_10d REAL, return_10d REAL, checked_10d TEXT,
         price_20d REAL, return_20d REAL, checked_20d TEXT,
+        price_30d REAL, return_30d REAL, checked_30d TEXT,
         price_60d REAL, return_60d REAL, checked_60d TEXT,
         UNIQUE(ticker, signal_date))''')
+    # Upgrade existing Phase 3 databases in place; preserve all saved predictions.
+    existing = {row[1] for row in con.execute("PRAGMA table_info(predictions)").fetchall()}
+    for horizon in (10, 30):
+        for suffix, kind in (("price", "REAL"), ("return", "REAL"), ("checked", "TEXT")):
+            column = f"{suffix}_{horizon}d"
+            if column not in existing:
+                con.execute(f"ALTER TABLE predictions ADD COLUMN {column} {kind}")
+    con.execute('''CREATE TABLE IF NOT EXISTS historical_learning (
+        ticker TEXT NOT NULL, signal_date TEXT NOT NULL, features_json TEXT,
+        return_5d REAL, return_10d REAL, return_20d REAL, return_30d REAL,
+        PRIMARY KEY(ticker, signal_date))''')
     con.commit()
     return con
 
@@ -354,8 +367,13 @@ def component_scores(row):
 
 def learned_weights():
     con=db_connect()
-    df=pd.read_sql_query("SELECT features_json, return_20d FROM predictions WHERE return_20d IS NOT NULL",con)
+    live=pd.read_sql_query("SELECT ticker,signal_date,features_json,return_20d FROM predictions WHERE return_20d IS NOT NULL",con)
+    historical=pd.read_sql_query("SELECT ticker,signal_date,features_json,return_20d FROM historical_learning WHERE return_20d IS NOT NULL",con)
     con.close()
+    df=pd.concat([live,historical],ignore_index=True).dropna(subset=["return_20d"])
+    # Do not give a ticker/date observation extra weight if it was recorded both ways.
+    if not df.empty:
+        df=df.drop_duplicates(subset=["ticker","signal_date"],keep="first")
     if len(df)<30:
         return BASE_WEIGHTS.copy(), len(df), False, []
     rows=[]
@@ -383,6 +401,25 @@ def score_with_weights(row, weights):
     denom=sum(weights[i] for i,_ in usable)
     return round(sum(v*weights[i] for i,v in usable)/denom,1) if denom else np.nan
 
+def explain_early_mover_score(row, weights):
+    """Return the visible indicator inputs and weighted contributions for one live score."""
+    labels=["1-week momentum","1-month momentum","3-month momentum","Price vs 50-day average","Price vs 200-day average","Volume change","Distance from 20-day high","Short-term extension"]
+    values=component_scores(row)
+    observed=[row.get(name) for name in FEATURES[:7]]+[row.get("Return 1W %")]
+    rows=[]; usable_weight=0
+    for i,(label,value,input_value) in enumerate(zip(labels,values,observed)):
+        if value is None: continue
+        usable_weight += float(weights[i])
+        rows.append({"Indicator":label,"Observed value":input_value,"Indicator score (0–100)":round(value,1),"Weight":float(weights[i])})
+    for item in rows:
+        item["Weighted contribution"] = round(item["Indicator score (0–100)"]*item["Weight"]/usable_weight,2) if usable_weight else 0
+    risks=[]
+    for key,label in [("Return 1W %","Short-term move may be extended"),("Return 1M %","Recent monthly momentum is negative"),("Price vs 50D %","Price is below its 50-day average"),("Above 200D %","Price is below its 200-day average"),("Volume Change %","Volume confirmation is weak or declining"),("Distance from 20D High %","Price is far below its recent high")]:
+        value=num(row.get(key))
+        if value is not None and ((key=="Return 1W %" and value>20) or (key=="Return 1M %" and value<0) or (key in ("Price vs 50D %","Above 200D %") and value<0) or (key=="Volume Change %" and value<0) or (key=="Distance from 20D High %" and value<-10)):
+            risks.append(f"{label} ({value:+.1f}%)")
+    return pd.DataFrame(rows), risks
+
 def save_predictions(frame, weights):
     con=db_connect(); saved=0
     for _,r in frame.iterrows():
@@ -403,7 +440,7 @@ def save_predictions(frame, weights):
 
 def refresh_prediction_outcomes():
     con=db_connect()
-    pending=pd.read_sql_query("SELECT * FROM predictions WHERE return_5d IS NULL OR return_20d IS NULL OR return_60d IS NULL",con)
+    pending=pd.read_sql_query("SELECT * FROM predictions WHERE return_5d IS NULL OR return_10d IS NULL OR return_20d IS NULL OR return_30d IS NULL OR return_60d IS NULL",con)
     con.close(); updated=0
     if pending.empty: return updated
     progress=st.progress(0,text="Checking prediction outcomes…")
@@ -415,7 +452,7 @@ def refresh_prediction_outcomes():
             # Entry date is the close used when the signal was recorded; count later sessions only.
             future=hist[hist.index.date > pd.Timestamp(r.signal_date).date()]
             changes={}
-            for horizon in (5,20,60):
+            for horizon in (5,10,20,30,60):
                 if pd.isna(getattr(r,f"return_{horizon}d")) and len(future)>=horizon:
                     px=num(future.iloc[horizon-1]); ret=(px/float(r.entry_price)-1)*100 if px and r.entry_price else None
                     changes[horizon]=(px,ret,datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -427,6 +464,26 @@ def refresh_prediction_outcomes():
         except Exception: pass
         progress.progress((n+1)/len(pending),text=f"Checking prediction {n+1}/{len(pending)}…")
     progress.empty(); return updated
+
+def store_historical_learning(frame):
+    """Persist historical outcomes so completed, earlier observations train future live scores."""
+    if frame is None or frame.empty:
+        return 0
+    con=db_connect(); saved=0
+    for _, row in frame.iterrows():
+        features={key:num(row.get(key)) for key in FEATURES[:7]}
+        comps=component_scores(row)
+        features[FEATURES[7]]=comps[7]
+        try:
+            con.execute("""INSERT OR REPLACE INTO historical_learning
+                (ticker,signal_date,features_json,return_5d,return_10d,return_20d,return_30d)
+                VALUES (?,?,?,?,?,?,?)""",
+                (str(row.get("Ticker","")),str(row.get("Signal date",""))[:10],json.dumps(features),
+                 num(row.get("Return 5d %")),num(row.get("Return 10d %")),num(row.get("Return 20d %")),num(row.get("Return 30d %"))))
+            saved+=1
+        except Exception:
+            continue
+    con.commit(); con.close(); return saved
 
 def historical_backtest_frame(hist, ticker, interval=5):
     """Create a simple historical walk-forward sample using only trailing data at each date."""
@@ -731,6 +788,12 @@ elif page=="Early-Mover Tracker":
         cols=["Ticker","Company","Price","Early-Mover Score","Signal Tier","Return 1W %","Return 1M %","Return 3M %","Price vs 50D %","Above 200D %","Volume Change %","Distance from 20D High %","Market Cap","Data Date","Scan Status"]
         st.dataframe(movers[[c for c in cols if c in movers.columns]].round(2),use_container_width=True,hide_index=True)
         st.download_button("Download early-mover rankings CSV",movers.to_csv(index=False).encode(),file_name="asx_early_mover_rankings.csv",mime="text/csv")
+        explain_ticker=st.selectbox("Explain a score",movers["Ticker"].tolist(),key="explain_early_mover")
+        explain_row=movers[movers["Ticker"]==explain_ticker].iloc[0]
+        factor_table,risk_notes=explain_early_mover_score(explain_row,learn_w)
+        st.markdown(f"**{explain_ticker} score: {explain_row['Early-Mover Score']:.1f}/100** — indicator scores are combined using the weights shown. This is a ranking score, not a likelihood.")
+        st.dataframe(factor_table,use_container_width=True,hide_index=True)
+        st.write("**Factors that may weaken the setup:**", "; ".join(risk_notes) if risk_notes else "No major technical warning from these indicators; missing announcements, dilution, liquidity, halts, and sudden news can still reverse a move.")
         prediction_selection=st.multiselect("Record these as formal predictions",movers["Ticker"].tolist(),key="prediction_select")
         if st.button("Save selected predictions to history",type="primary",disabled=not prediction_selection):
             chosen=movers[movers["Ticker"].isin(prediction_selection)].copy()
@@ -771,7 +834,7 @@ elif page=="Early-Mover Tracker":
 
 elif page=="Prediction Lab":
     st.header("🧠 Prediction Lab — accuracy and learning")
-    st.write("Every saved prediction is measured against its entry close after 5, 20 and 60 subsequent trading sessions. The learning engine reviews completed 20-day outcomes to estimate which signals have been more useful.")
+    st.write("Saved predictions are measured after 5, 10, 20, 30 and 60 subsequent trading sessions. The learning engine combines completed live predictions with completed 20-day observations from Phase 4 historical backtests to adjust indicator weights for future Early-Mover scores.")
     st.warning("This is a research experiment, not a proven forecasting model. It needs a meaningful number of saved predictions across different market conditions. It does not place trades.")
     a,b=st.columns([1,3])
     if a.button("Refresh outcomes from Yahoo Finance",type="primary"):
@@ -784,13 +847,13 @@ elif page=="Prediction Lab":
     else:
         total=len(predictions)
         st.subheader("Prediction performance")
-        metrics=st.columns(4); metrics[0].metric("Predictions recorded",total)
-        for col,h in zip(metrics[1:],(5,20,60)):
+        metrics=st.columns(6); metrics[0].metric("Predictions recorded",total)
+        for col,h in zip(metrics[1:],(5,10,20,30,60)):
             vals=pd.to_numeric(predictions[f"return_{h}d"],errors="coerce").dropna()
             wins=int((vals>0).sum()); count=len(vals)
             col.metric(f"{h}-day positive rate",f"{wins/count*100:.1f}%" if count else "Not ready",help=f"{wins} positive outcomes out of {count} completed predictions")
         summaries=[]
-        for h in (5,20,60):
+        for h in (5,10,20,30,60):
             vals=pd.to_numeric(predictions[f"return_{h}d"],errors="coerce").dropna()
             summaries.append({"Horizon":f"{h} trading days","Completed":len(vals),"Positive %":round((vals>0).mean()*100,1) if len(vals) else np.nan,"Average return %":round(vals.mean(),2) if len(vals) else np.nan,"Median return %":round(vals.median(),2) if len(vals) else np.nan})
         st.dataframe(pd.DataFrame(summaries),use_container_width=True,hide_index=True)
@@ -803,9 +866,9 @@ elif page=="Prediction Lab":
         else:
             st.info(f"The adaptive scoring is not active yet. {n}/30 completed 20-day outcomes are available. Until then, the original weights are used.")
         st.subheader("Individual predictions")
-        view_cols=["ticker","company","signal_date","entry_price","base_score","price_5d","return_5d","price_20d","return_20d","price_60d","return_60d"]
+        view_cols=["ticker","company","signal_date","entry_price","base_score","price_5d","return_5d","price_10d","return_10d","price_20d","return_20d","price_30d","return_30d","price_60d","return_60d"]
         view=predictions[view_cols].copy()
-        view.columns=["Ticker","Company","Signal date","Entry price","Signal score","5d price","5d return %","20d price","20d return %","60d price","60d return %"]
+        view.columns=["Ticker","Company","Signal date","Entry price","Signal score","5d price","5d return %","10d price","10d return %","20d price","20d return %","30d price","30d return %","60d price","60d return %"]
         st.dataframe(view.round(3),use_container_width=True,hide_index=True)
         st.download_button("Download complete prediction history CSV",predictions.to_csv(index=False).encode(),file_name="asx_prediction_history.csv",mime="text/csv")
         if st.button("Delete all saved prediction history",type="secondary"):
@@ -819,8 +882,8 @@ elif page=="Prediction Lab":
 
 elif page=="Phase 4 Backtest":
     st.header("🧪 Phase 4 — Historical Backtest & Diagnostics")
-    st.write("Replay the Phase 3 Early-Mover scoring rules at past dates, then compare each score with later price changes. This is separate from the live predictions saved in Prediction Lab.")
-    st.warning("Historical test uses the original fixed weights, trailing price data only, and the current ticker list. It excludes delisted companies, fees, spreads, dividends and market impact; survivorship bias and small samples can materially distort results. A score is not a probability or a forecast.")
+    st.write("Replay the Phase 3 Early-Mover scoring rules at past dates, compare them with later prices, and add completed historical observations to the learning engine. Those past results then inform the adaptive weights used for future live Early-Mover scores.")
+    st.warning("Historical test uses the original fixed weights, trailing price data only, and the current ticker list. It excludes delisted companies, fees, spreads and market impact; Yahoo's adjusted price history may be revised. Survivorship bias and small samples can materially distort results. A score is not a probability or a forecast.")
     backtest_codes=st.multiselect("Select shares for historical test",MASTER_TICKERS,default=MASTER_TICKERS[:min(8,len(MASTER_TICKERS))],key="p4_backtest_codes")
     interval=st.select_slider("Signal spacing (trading days)",[1,5,10,20],value=5,key="p4_interval")
     signal_threshold=st.slider("Score treated as a signal",40,90,65,key="p4_threshold")
@@ -843,11 +906,13 @@ elif page=="Phase 4 Backtest":
             st.session_state["p4_backtest"] = pd.concat(assembled,ignore_index=True) if assembled else pd.DataFrame()
             st.session_state["p4_backtest_failures"] = failed
             st.session_state["p4_backtest_threshold"] = signal_threshold
+            trained_rows=store_historical_learning(st.session_state["p4_backtest"])
+            st.session_state["p4_new_training_rows"]=trained_rows
     bt=st.session_state.get("p4_backtest",pd.DataFrame())
     if not bt.empty:
         cutoff=st.session_state.get("p4_backtest_threshold",signal_threshold)
         signals=bt[pd.to_numeric(bt["Score"],errors="coerce")>=cutoff].copy()
-        st.caption(f"{len(bt):,} historical observations; {len(signals):,} met the saved signal threshold of {cutoff}. Scores use fixed original weights to avoid using today's learned weights against old data.")
+        st.caption(f"{len(bt):,} historical observations; {len(signals):,} met the saved signal threshold of {cutoff}. This replay uses fixed original weights to avoid look-ahead in its own reported results. {st.session_state.get('p4_new_training_rows',0):,} observations were added to the 20-day learning pool; future live Early-Mover scores can use them once the minimum sample is reached.")
         st.subheader("Accuracy by timeframe")
         horizon_rows=[]
         for horizon in (5,10,20,30):
