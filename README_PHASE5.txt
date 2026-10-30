@@ -33,3 +33,6 @@ FILES
 - ASX_Listed_Companies.csv — ASX company list
 - requirements.txt — dependencies
 - README_PHASE5.txt — these instructions
+
+
+PHASE 5 FIX: This build includes backward compatibility for older cached scan results that do not yet contain VPA columns. If you see blank VPA scores on old results, run a fresh scan to calculate them from OHLCV price history.

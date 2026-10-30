@@ -821,6 +821,20 @@ elif page=="VPA Scanner":
         st.info("Run a full-market or quick promising-shares scan first. VPA uses the same downloaded price history.")
     else:
         vpa=scan[scan["Price"].notna()].copy()
+        # Backward compatibility: cached/session scan results from Phase 3 or
+        # earlier Phase 5 builds may not contain the newer VPA columns.
+        # Add them safely so the VPA page can still render instead of raising KeyError.
+        vpa_defaults = {
+            "VPA Score": np.nan,
+            "Accumulation Score": np.nan,
+            "Distribution Risk": np.nan,
+            "Effort Result Score": np.nan,
+            "VPA Signal": "VPA data not available in this saved scan",
+            "VPA Notes": "Run a fresh scan to calculate VPA from OHLCV history."
+        }
+        for column, default_value in vpa_defaults.items():
+            if column not in vpa.columns:
+                vpa[column] = default_value
         vpa=vpa.sort_values(["VPA Score","Accumulation Score"],ascending=False,na_position="last")
         a,b,c=st.columns(3)
         a.metric("Shares with VPA score",int(vpa["VPA Score"].notna().sum()))
