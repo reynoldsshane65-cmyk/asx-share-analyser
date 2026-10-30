@@ -6,8 +6,6 @@ from datetime import datetime
 import time
 import sqlite3
 import json
-import hashlib
-import tempfile
 from pathlib import Path
 
 st.set_page_config(page_title="ASX Share Analyser", page_icon="📈", layout="wide")
@@ -232,13 +230,93 @@ def download_price_batches(tickers, period, batch_size=30):
                 else:
                     # Single-symbol downloads can return flat columns.
                     h = data.copy() if len(batch) == 1 else pd.DataFrame()
-                wanted = [c for c in ["Open","High","Low","Close","Volume"] if c in h.columns]
+                wanted = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in h.columns]
                 h = h[wanted].dropna(subset=["Close"]) if "Close" in wanted else pd.DataFrame()
                 output[sym] = h
             except Exception:
                 output[sym] = pd.DataFrame()
         time.sleep(1.0)  # modest pause between batches
     return output
+
+
+def calculate_vpa(history):
+    """Rule-based Volume Price Analysis signals from daily OHLCV data.
+
+    Signals are evidence/flags, not proof of institutional activity. Scores are
+    normalized to 0-100 and deliberately conservative for thinly traded shares.
+    """
+    empty = {
+        "VPA Score": np.nan, "Accumulation Score": np.nan,
+        "Distribution Risk": np.nan, "Effort Result Score": np.nan,
+        "VPA Signal": "Insufficient OHLCV data", "VPA Notes": ""
+    }
+    if history is None or history.empty or len(history) < 30:
+        return empty
+    required = ["Open", "High", "Low", "Close", "Volume"]
+    if not all(c in history.columns for c in required):
+        return empty
+    x = history[required].dropna(subset=["High", "Low", "Close"]).copy()
+    x = x[(x["Volume"].fillna(0) >= 0) & (x["High"] >= x["Low"])]
+    if len(x) < 30:
+        return empty
+    x = x.tail(120)
+    o,h,l,c,v = (x[k].astype(float) for k in required)
+    spread=(h-l).replace(0,np.nan)
+    close_loc=((c-l)/spread).clip(0,1).fillna(.5)
+    vol_avg=v.rolling(20,min_periods=10).mean()
+    vol_ratio=(v/(vol_avg.replace(0,np.nan))).replace([np.inf,-np.inf],np.nan)
+    ret=c.pct_change()*100
+    up=ret>0.15; down=ret<-.15
+    recent=x.tail(20)
+    recent_ret=ret.tail(20)
+    recent_v=v.tail(20)
+    recent_avg=vol_avg.tail(20)
+    recent_loc=close_loc.tail(20)
+    # Volume-weighted directional pressure; bounded to avoid one print dominating.
+    vr=(recent_v/(recent_avg.replace(0,np.nan))).clip(0,4).fillna(0)
+    up_pressure=float(vr[up.reindex(vr.index,fill_value=False)].sum())
+    down_pressure=float(vr[down.reindex(vr.index,fill_value=False)].sum())
+    total_pressure=up_pressure+down_pressure
+    pressure_balance=(up_pressure-down_pressure)/total_pressure if total_pressure>0 else 0
+    price_range=(recent["High"].max()-recent["Low"].min())/max(float(c.iloc[-1]),1e-9)*100
+    # Accumulation is suggested by positive directional volume, closes firm in bars,
+    # and a contained range; this is a heuristic, not participant identification.
+    firm_closes=float(recent_loc.mean())
+    accumulation=float(np.clip(50+pressure_balance*28+(firm_closes-.5)*35-np.clip(price_range-18,0,30)*.35,0,100))
+    # Latest-bar event tests against the preceding 20 sessions (exclude today).
+    avg20=num(vol_avg.iloc[-1]); today_v=num(v.iloc[-1]); ratio=(today_v/avg20) if avg20 and avg20>0 else np.nan
+    prev_high=num(h.iloc[-21:-1].max()) if len(h)>=21 else None
+    today_close=float(c.iloc[-1]); today_high=float(h.iloc[-1]); today_low=float(l.iloc[-1])
+    today_loc=float(close_loc.iloc[-1]); today_ret=float(ret.iloc[-1]) if pd.notna(ret.iloc[-1]) else 0.0
+    today_spread=float(spread.iloc[-1]) if pd.notna(spread.iloc[-1]) else 0.0
+    median_spread=float(spread.tail(20).median()) if spread.tail(20).notna().any() else 0.0
+    no_supply=bool(today_ret<0 and ratio is not None and np.isfinite(ratio) and ratio<.75 and today_spread<=median_spread*1.15)
+    no_demand=bool(today_ret>0 and ratio is not None and np.isfinite(ratio) and ratio<.75 and today_spread<=median_spread*1.15)
+    stopping=bool(today_ret<0 and ratio is not None and np.isfinite(ratio) and ratio>=1.8 and today_loc>=.60)
+    upthrust=bool(prev_high is not None and today_high>prev_high and today_close<prev_high and today_loc<.45 and ratio is not None and np.isfinite(ratio) and ratio>=1.3)
+    breakout=bool(prev_high is not None and today_close>prev_high and ratio is not None and np.isfinite(ratio) and ratio>=1.5)
+    distribution=bool(ratio is not None and np.isfinite(ratio) and ratio>=1.8 and today_loc<.4 and (today_ret<=.5 or today_close>=float(c.tail(20).max())*.95))
+    # Effort/result: large relative volume with muted price progress is a caution;
+    # high volume with meaningful directional movement scores better.
+    absret=abs(today_ret)
+    effort=float(np.clip(50 + (min(absret,5)*8 if ratio and ratio>=1.3 else 0) - (max(0,(ratio or 0)-1.5)*12 if absret<1.0 else 0),0,100))
+    dist_risk=float(np.clip((35 if distribution else 0)+(40 if upthrust else 0)+(15 if no_demand else 0)+(10 if today_ret<0 and ratio and ratio>=1.5 and today_loc<.4 else 0),0,100))
+    event_bonus=(12 if no_supply else 0)+(18 if stopping else 0)+(18 if breakout else 0)
+    event_penalty=(18 if no_demand else 0)+(25 if upthrust else 0)+(18 if distribution else 0)
+    vpa_score=float(np.clip(accumulation*.55+effort*.20+25+event_bonus-event_penalty,0,100))
+    signals=[]
+    if breakout: signals.append("Volume-confirmed breakout")
+    if stopping: signals.append("Stopping volume")
+    if no_supply: signals.append("No supply")
+    if no_demand: signals.append("No demand")
+    if upthrust: signals.append("Upthrust / failed breakout")
+    if distribution: signals.append("Possible distribution")
+    if not signals:
+        signals.append("No strong latest-bar event")
+    notes=f"20-session accumulation {accumulation:.0f}/100; latest volume {ratio:.2f}x 20-day average" if ratio is not None and np.isfinite(ratio) else f"20-session accumulation {accumulation:.0f}/100; volume baseline unavailable"
+    return {"VPA Score":round(vpa_score,1),"Accumulation Score":round(accumulation,1),
+            "Distribution Risk":round(dist_risk,1),"Effort Result Score":round(effort,1),
+            "VPA Signal":"; ".join(signals),"VPA Notes":notes}
 
 
 def run_scan(tickers, period):
@@ -266,7 +344,7 @@ def run_scan(tickers, period):
                 "200D Average": np.nan, "Above 200D %": np.nan,
                 "Volume Change %": np.nan, "Market Cap": np.nan,
                 "P/E": np.nan, "Revenue Growth %": np.nan,
-                "Profit Margin %": np.nan, "Fundamentals Status": "Not fetched (no prices)",
+                "Profit Margin %": np.nan, "VPA Score": np.nan, "Accumulation Score": np.nan, "Distribution Risk": np.nan, "Effort Result Score": np.nan, "VPA Signal": "No price data", "VPA Notes": "", "Fundamentals Status": "Not fetched (no prices)",
                 "Data Date": "", "Scan Status": status
             })
             progress.progress(0.15 + 0.85 * (i + 1) / total, text=f"Checking {sym} ({i+1}/{total})…")
@@ -277,13 +355,6 @@ def run_scan(tickers, period):
         ma200 = close.tail(200).mean() if len(close) >= 200 else np.nan
         v20 = num(vol.tail(20).mean()) if len(vol) >= 20 else None
         vprev = num(vol.iloc[-40:-20].mean()) if len(vol) >= 40 else None
-        day_high=num(h["High"].iloc[-1]) if "High" in h else None
-        day_low=num(h["Low"].iloc[-1]) if "Low" in h else None
-        day_open=num(h["Open"].iloc[-1]) if "Open" in h else None
-        day_range=(day_high-day_low)/float(close.iloc[-1])*100 if day_high is not None and day_low is not None and float(close.iloc[-1]) else np.nan
-        close_location=(float(close.iloc[-1])-day_low)/(day_high-day_low)*100 if day_high is not None and day_low is not None and day_high>day_low else np.nan
-        day_gap=(day_open/float(close.iloc[-2])-1)*100 if day_open is not None and len(close)>1 and float(close.iloc[-2]) else np.nan
-        volatility=close.pct_change().tail(20).std()*100 if len(close)>=21 else np.nan
 
         # Limit fundamental calls during a full-market scan. Fetch one info
         # payload only; don't request financial statements for every missing field.
@@ -311,10 +382,8 @@ def run_scan(tickers, period):
             "200D Average": num(ma200),
             "Above 200D %": (close.iloc[-1] / ma200 - 1) * 100 if pd.notna(ma200) and ma200 else np.nan,
             "Volume Change %": (v20 / vprev - 1) * 100 if v20 is not None and vprev not in (None, 0) else np.nan,
-            "Daily range %": day_range, "Close in daily range %": close_location,
-            "Gap %": day_gap, "20D volatility %": volatility,
             "Market Cap": market_cap, "P/E": pe, "Revenue Growth %": revenue_growth,
-            "Profit Margin %": profit_margin, "Fundamentals Status": fundamentals_status,
+            "Profit Margin %": profit_margin, **calculate_vpa(h), "Fundamentals Status": fundamentals_status,
             "Data Date": close.index[-1].strftime("%Y-%m-%d"),
             "Scan Status": "Scanned successfully"
         })
@@ -329,9 +398,8 @@ def run_scan(tickers, period):
 
 # ---------------- Self-learning prediction engine ----------------
 DB_PATH = Path(__file__).with_name("asx_prediction_history.sqlite")
-FEATURES = ["Return 1W %", "Return 1M %", "Return 3M %", "Price vs 50D %", "Above 200D %", "Volume Change %", "Distance from 20D High %", "Short-term extension", "Daily range %", "Close in daily range %", "Gap %", "20D volatility %"]
-# Preserve the original Phase 3 factor balance while reserving 20% for four OHLCV features.
-BASE_WEIGHTS = np.array([0.12, 0.12, 0.08, 0.08, 0.08, 0.16, 0.08, 0.08, 0.05, 0.05, 0.05, 0.05], dtype=float)
+FEATURES = ["Return 1W %", "Return 1M %", "Return 3M %", "Price vs 50D %", "Above 200D %", "Volume Change %", "Distance from 20D High %", "Short-term extension", "VPA Score", "Accumulation Score", "Distribution Safety", "Effort Result Score"]
+BASE_WEIGHTS = np.array([0.12, 0.12, 0.08, 0.08, 0.08, 0.16, 0.08, 0.08, 0.12, 0.04, 0.02, 0.02], dtype=float)
 
 def db_connect():
     con = sqlite3.connect(DB_PATH, timeout=30)
@@ -341,89 +409,11 @@ def db_connect():
         signal_date TEXT NOT NULL, entry_price REAL NOT NULL, base_score REAL,
         components_json TEXT, features_json TEXT, weights_json TEXT,
         price_5d REAL, return_5d REAL, checked_5d TEXT,
-        price_10d REAL, return_10d REAL, checked_10d TEXT,
         price_20d REAL, return_20d REAL, checked_20d TEXT,
-        price_30d REAL, return_30d REAL, checked_30d TEXT,
         price_60d REAL, return_60d REAL, checked_60d TEXT,
         UNIQUE(ticker, signal_date))''')
-    # Upgrade existing Phase 3 databases in place; preserve all saved predictions.
-    existing = {row[1] for row in con.execute("PRAGMA table_info(predictions)").fetchall()}
-    for horizon in (10, 30):
-        for suffix, kind in (("price", "REAL"), ("return", "REAL"), ("checked", "TEXT")):
-            column = f"{suffix}_{horizon}d"
-            if column not in existing:
-                con.execute(f"ALTER TABLE predictions ADD COLUMN {column} {kind}")
-    con.execute('''CREATE TABLE IF NOT EXISTS historical_learning (
-        ticker TEXT NOT NULL, signal_date TEXT NOT NULL, entry_price REAL, features_json TEXT,
-        return_5d REAL, return_10d REAL, return_20d REAL, return_30d REAL,
-        PRIMARY KEY(ticker, signal_date))''')
-    learning_columns={row[1] for row in con.execute("PRAGMA table_info(historical_learning)").fetchall()}
-    if "entry_price" not in learning_columns:
-        con.execute("ALTER TABLE historical_learning ADD COLUMN entry_price REAL")
-    con.execute('''CREATE TABLE IF NOT EXISTS historical_learning_monthly (
-        ticker TEXT NOT NULL, month_key TEXT NOT NULL, signal_date TEXT NOT NULL,
-        features_json TEXT, return_20d REAL, PRIMARY KEY(ticker,month_key))''')
-    con.execute("CREATE TABLE IF NOT EXISTS app_meta (meta_key TEXT PRIMARY KEY,meta_value TEXT)")
-    migrated=con.execute("SELECT 1 FROM app_meta WHERE meta_key='monthly_learning_backfill_v1'").fetchone()
-    if not migrated:
-        con.execute("""INSERT OR IGNORE INTO historical_learning_monthly
-            (ticker,month_key,signal_date,features_json,return_20d)
-            SELECT ticker,substr(signal_date,1,7),signal_date,features_json,return_20d
-            FROM historical_learning WHERE return_20d IS NOT NULL
-            ORDER BY ticker,substr(signal_date,1,7),signal_date""")
-        con.execute("INSERT INTO app_meta (meta_key,meta_value) VALUES ('monthly_learning_backfill_v1','done')")
-    con.execute('''CREATE TABLE IF NOT EXISTS historical_prices (
-        ticker TEXT NOT NULL, price_date TEXT NOT NULL, open REAL, high REAL, low REAL, close REAL, volume REAL,
-        PRIMARY KEY(ticker, price_date))''')
-    price_columns={row[1] for row in con.execute("PRAGMA table_info(historical_prices)").fetchall()}
-    for column in ("open","high","low"):
-        if column not in price_columns: con.execute(f"ALTER TABLE historical_prices ADD COLUMN {column} REAL")
-    con.execute('''CREATE TABLE IF NOT EXISTS historical_batch_jobs (
-        job_key TEXT PRIMARY KEY, universe_json TEXT NOT NULL, next_index INTEGER NOT NULL DEFAULT 0,
-        period TEXT NOT NULL, interval_days INTEGER NOT NULL, updated_at TEXT NOT NULL)''')
-    con.execute('''CREATE TABLE IF NOT EXISTS historical_batch_failures (
-        job_key TEXT NOT NULL, ticker TEXT NOT NULL, reason TEXT, updated_at TEXT NOT NULL,
-        PRIMARY KEY(job_key,ticker))''')
     con.commit()
     return con
-
-def sqlite_backup_bytes():
-    """Create a consistent SQLite snapshot, including committed WAL data, for download."""
-    if not DB_PATH.exists():
-        return None
-    with tempfile.TemporaryDirectory() as folder:
-        backup_path=Path(folder)/"asx_prediction_history.sqlite"
-        source=sqlite3.connect(str(DB_PATH),timeout=30)
-        target=sqlite3.connect(str(backup_path),timeout=30)
-        try:
-            source.backup(target)
-        finally:
-            target.close(); source.close()
-        return backup_path.read_bytes()
-
-def render_database_backup(key_prefix):
-    st.caption("This backup contains the saved prediction database, batch progress, cached historical OHLCV prices, and learning outcomes.")
-    if st.button("Prepare SQLite database backup",key=f"{key_prefix}_prepare_db_backup"):
-        try:
-            st.session_state["sqlite_backup_bytes"]=sqlite_backup_bytes()
-            st.session_state["sqlite_backup_filename"]=f"asx_prediction_history_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.sqlite"
-        except Exception as exc:
-            st.error(f"Could not prepare the database backup: {exc}")
-    backup=st.session_state.get("sqlite_backup_bytes")
-    if backup:
-        st.download_button("Download SQLite backup",data=backup,file_name=st.session_state.get("sqlite_backup_filename","asx_prediction_history_backup.sqlite"),mime="application/vnd.sqlite3",key=f"{key_prefix}_download_db_backup")
-
-def render_database_backup(key_prefix):
-    st.caption("This backup contains the saved prediction database, batch progress, cached historical OHLCV prices, and learning outcomes.")
-    if st.button("Prepare SQLite database backup",key=f"{key_prefix}_prepare_db_backup"):
-        try:
-            st.session_state["sqlite_backup_bytes"]=sqlite_backup_bytes()
-            st.session_state["sqlite_backup_filename"]=f"asx_prediction_history_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.sqlite"
-        except Exception as exc:
-            st.error(f"Could not prepare the database backup: {exc}")
-    backup=st.session_state.get("sqlite_backup_bytes")
-    if backup:
-        st.download_button("Download SQLite backup",data=backup,file_name=st.session_state.get("sqlite_backup_filename","asx_prediction_history_backup.sqlite"),mime="application/vnd.sqlite3",key=f"{key_prefix}_download_db_backup")
 
 def component_scores(row):
     def val(k):
@@ -439,111 +429,35 @@ def component_scores(row):
         np.clip(50+vol*.35,0,100) if vol is not None else np.nan,
         np.clip(100+high*5,0,100) if high is not None else np.nan,
         (100 if 0<=extension<=12 else (65 if -3<=extension<0 or 12<extension<=20 else 25)) if extension is not None else np.nan,
-        np.clip(80-val("Daily range %")*2,0,100) if val("Daily range %") is not None else np.nan,
-        np.clip(val("Close in daily range %"),0,100) if val("Close in daily range %") is not None else np.nan,
-        np.clip(50+val("Gap %")*4,0,100) if val("Gap %") is not None else np.nan,
-        np.clip(100-val("20D volatility %")*4,0,100) if val("20D volatility %") is not None else np.nan,
     ]
+    vpa, accum, effort = val("VPA Score"), val("Accumulation Score"), val("Effort Result Score")
+    dist = val("Distribution Risk")
+    values.extend([vpa, accum, (100-dist) if dist is not None else np.nan, effort])
     return [None if pd.isna(x) else float(x) for x in values]
 
-def learned_weights(cutoff_date=None):
+def learned_weights():
     con=db_connect()
-    # A full-universe history may contain millions of rows. Stream through them
-    # and retain only the sums needed to calculate each indicator correlation.
-    historical_filter="WHERE h.return_20d IS NOT NULL"
-    live_filter="WHERE p.return_20d IS NOT NULL"
-    query_params=[]
-    if cutoff_date:
-        historical_filter+=" AND h.signal_date < ?"
-        live_filter+=" AND p.signal_date < ?"
-        query_params=[cutoff_date,cutoff_date]
-    query="""WITH observations AS (
-          SELECT h.ticker,h.signal_date,h.features_json,h.return_20d FROM historical_learning_monthly h
-          """+historical_filter+"""
-          UNION ALL
-          SELECT p.ticker,p.signal_date,p.features_json,p.return_20d FROM predictions p """+live_filter+"""
-        ), monthly AS (
-          SELECT features_json,return_20d,
-                 ROW_NUMBER() OVER (PARTITION BY ticker,substr(signal_date,1,7) ORDER BY signal_date) AS month_row
-          FROM observations
-        ) SELECT features_json,return_20d FROM monthly WHERE month_row=1"""
-    cursors=[con.execute(query,query_params)]
-    stats={feature:[0,0.0,0.0,0.0,0.0,0.0] for feature in FEATURES}
-    observations=0
-    for cursor in cursors:
-        while True:
-            chunk=cursor.fetchmany(5000)
-            if not chunk: break
-            for features_json,target_value in chunk:
-                target=num(target_value)
-                if target is None: continue
-                observations+=1
-                try: features=json.loads(features_json or "{}")
-                except Exception: features={}
-                for feature in FEATURES:
-                    value=num(features.get(feature))
-                    if value is None or not np.isfinite(value): continue
-                    item=stats[feature]; item[0]+=1; item[1]+=value; item[2]+=target
-                    item[3]+=value*value; item[4]+=target*target; item[5]+=value*target
+    df=pd.read_sql_query("SELECT features_json, return_20d FROM predictions WHERE return_20d IS NOT NULL",con)
     con.close()
-    if observations<30:
-        return BASE_WEIGHTS.copy(), observations, False, []
+    if len(df)<30:
+        return BASE_WEIGHTS.copy(), len(df), False, []
+    rows=[]
+    for _,r in df.iterrows():
+        try: rows.append(json.loads(r["features_json"] or "{}"))
+        except Exception: rows.append({})
+    f=pd.DataFrame(rows)
+    target=pd.to_numeric(df["return_20d"],errors="coerce")
     correlations=[]
     for feature in FEATURES:
-        n,sx,sy,sxx,syy,sxy=stats[feature]
-        vx=sxx-sx*sx/n if n else 0.0; vy=syy-sy*sy/n if n else 0.0
-        cov=sxy-sx*sy/n if n else 0.0
-        corr=cov/(vx*vy)**0.5 if n>=20 and vx>0 and vy>0 else 0.0
-        correlations.append(float(corr) if np.isfinite(corr) else 0.0)
+        x=pd.to_numeric(f[feature] if feature in f.columns else pd.Series(np.nan,index=f.index),errors="coerce")
+        pair=pd.concat([x,target],axis=1).dropna()
+        corr=float(pair.iloc[:,0].corr(pair.iloc[:,1])) if len(pair)>=20 and pair.iloc[:,0].nunique()>1 else 0.0
+        correlations.append(corr if np.isfinite(corr) else 0.0)
     # Blend empirical relationships conservatively with the original transparent weights.
     multipliers=np.clip(1+1.5*np.array(correlations),0.5,1.5)
     weights=BASE_WEIGHTS*multipliers
     weights=weights/weights.sum()
-    return weights, observations, True, correlations
-
-def learning_source_counts():
-    con=db_connect()
-    historical=int(con.execute("SELECT COUNT(*) FROM historical_learning_monthly WHERE return_20d IS NOT NULL").fetchone()[0])
-    live=int(con.execute("SELECT COUNT(*) FROM predictions WHERE return_20d IS NOT NULL").fetchone()[0])
-    con.close()
-    return historical,live
-
-def render_learning_dashboard():
-    st.subheader("Learning status")
-    weights,n,active,corr=learned_weights()
-    historical_examples,live_examples=learning_source_counts()
-    source_cols=st.columns(3)
-    source_cols[0].metric("Historical monthly examples",historical_examples,help="Phase 4 backtest observations with a completed 20-trading-day outcome.")
-    source_cols[1].metric("Live predictions with 20-day outcomes",live_examples)
-    source_cols[2].metric("Effective examples used",n,help="The model keeps about one 20-day training example per ticker per calendar month to reduce overlap.")
-    if active:
-        learned=pd.DataFrame({"Indicator":FEATURES,"Original weight %":BASE_WEIGHTS*100,"Learned weight %":weights*100,"Change (percentage points)":(weights-BASE_WEIGHTS)*100,"Correlation with 20-day return":corr})
-        st.dataframe(learned.round(3),use_container_width=True,hide_index=True)
-        st.caption("Adaptive weights are active. Correlations are descriptive, not causal, and weights are blended conservatively with the base weights.")
-    else:
-        st.info(f"Adaptive scoring is not active yet. {n}/30 effective completed 20-day examples are available; the original weights are still used.")
-
-def render_learning_dashboard():
-    st.subheader("Learning status")
-    weights,n,active,corr=learned_weights()
-    historical_examples,live_examples=learning_source_counts()
-    source_cols=st.columns(3)
-    source_cols[0].metric("Historical monthly examples",historical_examples,help="Phase 4 backtest observations with a completed 20-trading-day outcome.")
-    source_cols[1].metric("Live predictions with 20-day outcomes",live_examples)
-    source_cols[2].metric("Effective examples used",n,help="The model keeps about one 20-day training example per ticker per calendar month to reduce overlap.")
-    if active:
-        learned=pd.DataFrame({"Indicator":FEATURES,"Original weight %":BASE_WEIGHTS*100,"Learned weight %":weights*100,"Change (percentage points)":(weights-BASE_WEIGHTS)*100,"Correlation with 20-day return":corr})
-        st.dataframe(learned.round(3),use_container_width=True,hide_index=True)
-        st.caption("Adaptive weights are active. Correlations are descriptive, not causal, and weights are blended conservatively with the base weights.")
-    else:
-        st.info(f"Adaptive scoring is not active yet. {n}/30 effective completed 20-day examples are available; the original weights are still used.")
-
-def learning_source_counts():
-    con=db_connect()
-    historical=int(con.execute("SELECT COUNT(*) FROM historical_learning_monthly WHERE return_20d IS NOT NULL").fetchone()[0])
-    live=int(con.execute("SELECT COUNT(*) FROM predictions WHERE return_20d IS NOT NULL").fetchone()[0])
-    con.close()
-    return historical,live
+    return weights, len(df), True, correlations
 
 def score_with_weights(row, weights):
     comps=component_scores(row)
@@ -551,29 +465,6 @@ def score_with_weights(row, weights):
     if not usable: return np.nan
     denom=sum(weights[i] for i,_ in usable)
     return round(sum(v*weights[i] for i,v in usable)/denom,1) if denom else np.nan
-
-def explain_early_mover_score(row, weights):
-    """Return the visible indicator inputs and weighted contributions for one live score."""
-    labels=["1-week momentum","1-month momentum","3-month momentum","Price vs 50-day average","Price vs 200-day average","Volume change","Distance from 20-day high","Short-term extension","Daily trading range","Close position in daily range","Opening gap","20-day volatility"]
-    values=component_scores(row)
-    observed=[row.get(name) for name in FEATURES[:7]]+[row.get("Return 1W %")]+[row.get(name) for name in FEATURES[8:]]
-    rows=[]; usable_weight=0
-    for i,(label,value,input_value) in enumerate(zip(labels,values,observed)):
-        if value is None: continue
-        usable_weight += float(weights[i])
-        rows.append({"Indicator":label,"Observed value":input_value,"Indicator score (0–100)":round(value,1),"Weight":float(weights[i])})
-    for item in rows:
-        item["Weighted contribution"] = round(item["Indicator score (0–100)"]*item["Weight"]/usable_weight,2) if usable_weight else 0
-    risks=[]
-    for key,label in [("Return 1W %","Short-term move may be extended"),("Return 1M %","Recent monthly momentum is negative"),("Price vs 50D %","Price is below its 50-day average"),("Above 200D %","Price is below its 200-day average"),("Volume Change %","Volume confirmation is weak or declining"),("Distance from 20D High %","Price is far below its recent high")]:
-        value=num(row.get(key))
-        if value is not None and ((key=="Return 1W %" and value>20) or (key=="Return 1M %" and value<0) or (key in ("Price vs 50D %","Above 200D %") and value<0) or (key=="Volume Change %" and value<0) or (key=="Distance from 20D High %" and value<-10)):
-            risks.append(f"{label} ({value:+.1f}%)")
-    vol20=num(row.get("20D volatility %")); close_pos=num(row.get("Close in daily range %")); gap=num(row.get("Gap %"))
-    if vol20 is not None and vol20>5: risks.append(f"Recent daily volatility is high ({vol20:.1f}%)")
-    if close_pos is not None and close_pos<25: risks.append(f"Latest close is near the bottom of its daily range ({close_pos:.0f}%)")
-    if gap is not None and gap<-3: risks.append(f"Latest session opened down sharply ({gap:.1f}%)")
-    return pd.DataFrame(rows), risks
 
 def save_predictions(frame, weights):
     con=db_connect(); saved=0
@@ -584,8 +475,12 @@ def save_predictions(frame, weights):
         # Previously `comps` was referenced one line too early, causing
         # UnboundLocalError whenever a prediction was saved.
         comps=component_scores(r)
-        features={k:num(r.get(k)) for k in FEATURES}
+        features={k:num(r.get(k)) for k in FEATURES[:7]}
         features[FEATURES[7]]=comps[7]
+        features["VPA Score"]=num(r.get("VPA Score"))
+        features["Accumulation Score"]=num(r.get("Accumulation Score"))
+        dr=num(r.get("Distribution Risk")); features["Distribution Safety"]=(100-dr) if dr is not None else None
+        features["Effort Result Score"]=num(r.get("Effort Result Score"))
         try:
             cur=con.execute("INSERT OR IGNORE INTO predictions (ticker,company,signal_date,entry_price,base_score,components_json,features_json,weights_json) VALUES (?,?,?,?,?,?,?,?)",
                 (ticker,str(r.get("Company",ticker)),date,float(price),num(r.get("Early-Mover Score")),json.dumps(comps),json.dumps(features),json.dumps(weights.tolist())))
@@ -595,7 +490,7 @@ def save_predictions(frame, weights):
 
 def refresh_prediction_outcomes():
     con=db_connect()
-    pending=pd.read_sql_query("SELECT * FROM predictions WHERE return_5d IS NULL OR return_10d IS NULL OR return_20d IS NULL OR return_30d IS NULL OR return_60d IS NULL",con)
+    pending=pd.read_sql_query("SELECT * FROM predictions WHERE return_5d IS NULL OR return_20d IS NULL OR return_60d IS NULL",con)
     con.close(); updated=0
     if pending.empty: return updated
     progress=st.progress(0,text="Checking prediction outcomes…")
@@ -607,7 +502,7 @@ def refresh_prediction_outcomes():
             # Entry date is the close used when the signal was recorded; count later sessions only.
             future=hist[hist.index.date > pd.Timestamp(r.signal_date).date()]
             changes={}
-            for horizon in (5,10,20,30,60):
+            for horizon in (5,20,60):
                 if pd.isna(getattr(r,f"return_{horizon}d")) and len(future)>=horizon:
                     px=num(future.iloc[horizon-1]); ret=(px/float(r.entry_price)-1)*100 if px and r.entry_price else None
                     changes[horizon]=(px,ret,datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -620,231 +515,10 @@ def refresh_prediction_outcomes():
         progress.progress((n+1)/len(pending),text=f"Checking prediction {n+1}/{len(pending)}…")
     progress.empty(); return updated
 
-def store_historical_learning(frame):
-    """Persist historical outcomes so completed, earlier observations train future live scores."""
-    if frame is None or frame.empty:
-        return 0
-    con=db_connect(); saved=0
-    for _, row in frame.iterrows():
-        features={key:num(row.get(key)) for key in FEATURES}
-        comps=component_scores(row)
-        features[FEATURES[7]]=comps[7]
-        try:
-            con.execute("""INSERT OR REPLACE INTO historical_learning
-                (ticker,signal_date,entry_price,features_json,return_5d,return_10d,return_20d,return_30d)
-                VALUES (?,?,?,?,?,?,?,?)""",
-                (str(row.get("Ticker","")),str(row.get("Signal date",""))[:10],num(row.get("Entry price")),json.dumps(features),
-                 num(row.get("Return 5d %")),num(row.get("Return 10d %")),num(row.get("Return 20d %")),num(row.get("Return 30d %"))))
-            signal_date=str(row.get("Signal date",""))[:10]
-            con.execute("""INSERT INTO historical_learning_monthly
-                (ticker,month_key,signal_date,features_json,return_20d) VALUES (?,?,?,?,?)
-                ON CONFLICT(ticker,month_key) DO UPDATE SET signal_date=excluded.signal_date,
-                features_json=excluded.features_json,return_20d=excluded.return_20d
-                WHERE excluded.signal_date<=historical_learning_monthly.signal_date""",
-                (str(row.get("Ticker","")),signal_date[:7],signal_date,json.dumps(features),num(row.get("Return 20d %"))))
-            saved+=1
-        except Exception:
-            continue
-    con.commit(); con.close(); return saved
-
-def save_historical_prices(ticker, hist):
-    """Cache downloaded adjusted OHLCV data so completed batches are reusable."""
-    if hist is None or hist.empty or "Close" not in hist:
-        return 0
-    records=[]
-    for date,row in hist.iterrows():
-        opn=num(row.get("Open")); high=num(row.get("High")); low=num(row.get("Low"))
-        close=num(row.get("Close")); volume=num(row.get("Volume")) if "Volume" in hist.columns else None
-        if close is not None:
-            records.append((ticker,pd.Timestamp(date).strftime("%Y-%m-%d"),opn,high,low,close,volume))
-    if not records: return 0
-    con=db_connect()
-    con.executemany("INSERT OR REPLACE INTO historical_prices (ticker,price_date,open,high,low,close,volume) VALUES (?,?,?,?,?,?,?)",records)
-    con.commit(); con.close(); return len(records)
-
-def load_historical_prices(ticker):
-    con=db_connect()
-    frame=pd.read_sql_query("SELECT price_date AS Date,open AS Open,high AS High,low AS Low,close AS Close,volume AS Volume FROM historical_prices WHERE ticker=? ORDER BY price_date",con,params=(ticker,))
-    con.close()
-    if frame.empty: return frame
-    frame["Date"]=pd.to_datetime(frame["Date"])
-    return frame.set_index("Date")
-
-def process_historical_batch(batch_codes, job_key, interval, batch_number=None, batch_total=None):
-    """Download, cache, evaluate, and checkpoint one small group of tickers."""
-    failures=[]
-    label=f"Downloading maximum available history for batch {batch_number}/{batch_total}…" if batch_number is not None else "Downloading maximum available history…"
-    progress=st.progress(0,text=label)
-    price_sets=download_price_batches(batch_codes,"max",batch_size=30)
-    for idx,ticker in enumerate(batch_codes):
-        try:
-            prices=price_sets.get(ticker,pd.DataFrame())
-            if prices is not None and not prices.empty:
-                save_historical_prices(ticker,prices)
-            else:
-                prices=load_historical_prices(ticker)
-            one=historical_backtest_frame(prices,ticker,int(interval))
-            if one.empty:
-                failures.append({"Ticker":ticker,"Reason":"No cached or online history long enough to calculate the 200-day trend and later outcomes."})
-            else:
-                store_historical_learning(one)
-        except Exception as exc:
-            failures.append({"Ticker":ticker,"Reason":str(exc)[:200]})
-        con=db_connect()
-        failure=next((item["Reason"] for item in failures if item["Ticker"]==ticker),None)
-        if failure:
-            con.execute("INSERT OR REPLACE INTO historical_batch_failures (job_key,ticker,reason,updated_at) VALUES (?,?,?,?)",(job_key,ticker,failure,datetime.now().isoformat(timespec="seconds")))
-        else:
-            con.execute("DELETE FROM historical_batch_failures WHERE job_key=? AND ticker=?",(job_key,ticker))
-        con.commit(); con.close()
-        progress.progress((idx+1)/max(1,len(batch_codes)),text=f"Processed {ticker} ({idx+1}/{len(batch_codes)} in batch)…")
-    progress.empty()
-    return failures
-
-def load_historical_learning(tickers):
-    """Load a representative display sample; all rows remain stored and feed training."""
-    if not tickers: return pd.DataFrame()
-    con=db_connect()
-    if len(tickers)==len(MASTER_TICKERS) and set(tickers)==set(MASTER_TICKERS):
-        where=""
-        params=()
-    else:
-        where="WHERE ticker IN ("+",".join("?" for _ in tickers)+")"
-        params=tuple(tickers)
-    total=int(con.execute("SELECT COUNT(*) FROM historical_learning "+where,params).fetchone()[0])
-    sql="""WITH ranked AS (
-        SELECT ticker,signal_date,entry_price,features_json,return_5d,return_10d,return_20d,return_30d,
-               ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY signal_date) AS rn,
-               COUNT(*) OVER (PARTITION BY ticker) AS ticker_n
-        FROM historical_learning """+where+"""
-    ) SELECT ticker,signal_date,entry_price,features_json,return_5d,return_10d,return_20d,return_30d
-      FROM ranked WHERE rn=1 OR rn % CASE WHEN ticker_n>30 THEN CAST((ticker_n+29)/30 AS INTEGER) ELSE 1 END=0"""
-    data=pd.read_sql_query(sql,con,params=params)
-    con.close()
-    if data.empty: return pd.DataFrame()
-    rows=[]
-    for _,record in data.iterrows():
-        try: features=json.loads(record.get("features_json") or "{}")
-        except Exception: features={}
-        row={**features,"Ticker":record["ticker"],"Signal date":record["signal_date"],"Entry price":record["entry_price"]}
-        row["Score"]=score_with_weights(row,BASE_WEIGHTS)
-        for h in (5,10,20,30): row[f"Return {h}d %"]=record[f"return_{h}d"]
-        rows.append(row)
-    result=pd.DataFrame(rows)
-    result.attrs["total_observations"]=total
-    result.attrs["display_sampled"]=total>len(result)
-    return result
-
-def batch_job_state(tickers, interval):
-    universe=json.dumps(list(tickers),separators=(",",":"))
-    job_key=hashlib.sha1((universe+"|max|"+str(interval)).encode("utf-8")).hexdigest()[:20]
-    con=db_connect()
-    record=con.execute("SELECT universe_json,next_index FROM historical_batch_jobs WHERE job_key=?",(job_key,)).fetchone()
-    if record is None:
-        con.execute("INSERT INTO historical_batch_jobs (job_key,universe_json,next_index,period,interval_days,updated_at) VALUES (?,?,?,?,?,?)",
-                    (job_key,universe,0,"max",int(interval),datetime.now().isoformat(timespec="seconds")))
-        con.commit(); next_index=0
-    else: next_index=int(record[1])
-    con.close()
-    return job_key,next_index
-
-def set_batch_job_index(job_key, tickers, interval, next_index):
-    con=db_connect()
-    con.execute("UPDATE historical_batch_jobs SET next_index=?,updated_at=? WHERE job_key=?",
-                (int(next_index),datetime.now().isoformat(timespec="seconds"),job_key))
-    con.commit(); con.close()
-
-def historical_backtest_frame(hist, ticker, interval=5):
-    """Create a simple historical walk-forward sample using only trailing data at each date."""
-    if hist is None or hist.empty or "Close" not in hist:
-        return pd.DataFrame()
-    close = hist["Close"].dropna().astype(float)
-    volume = hist["Volume"].fillna(0).astype(float) if "Volume" in hist else pd.Series(0.0, index=close.index)
-    horizons = (5, 10, 20, 30)
-    rows = []
-    # 200 sessions of prior context are required for the long-trend indicator.
-    for i in range(200, len(close) - max(horizons), interval):
-        past = close.iloc[:i+1]
-        vpast = volume.reindex(past.index).fillna(0)
-        price = float(past.iloc[-1])
-        ma50 = float(past.tail(50).mean())
-        ma200 = float(past.tail(200).mean())
-        v20 = float(vpast.tail(20).mean())
-        vprev = float(vpast.iloc[-40:-20].mean()) if len(vpast) >= 40 else 0.0
-        day_open=num(hist["Open"].iloc[i]) if "Open" in hist else None
-        day_high=num(hist["High"].iloc[i]) if "High" in hist else None
-        day_low=num(hist["Low"].iloc[i]) if "Low" in hist else None
-        day_range=(day_high-day_low)/price*100 if day_high is not None and day_low is not None and price else np.nan
-        close_location=(price-day_low)/(day_high-day_low)*100 if day_high is not None and day_low is not None and day_high>day_low else np.nan
-        day_gap=(day_open/float(close.iloc[i-1])-1)*100 if day_open is not None and i>0 and float(close.iloc[i-1]) else np.nan
-        volatility=past.pct_change().tail(20).std()*100 if len(past)>=21 else np.nan
-        row = {
-            "Return 1W %": pct(past, 5), "Return 1M %": pct(past, 21),
-            "Return 3M %": pct(past, 63), "Price vs 50D %": (price/ma50-1)*100 if ma50 else np.nan,
-            "Above 200D %": (price/ma200-1)*100 if ma200 else np.nan,
-            "Volume Change %": (v20/vprev-1)*100 if vprev else np.nan,
-            "Daily range %":day_range,"Close in daily range %":close_location,
-            "Gap %":day_gap,"20D volatility %":volatility,
-            "Distance from 20D High %": (price/float(past.tail(20).max())-1)*100 if len(past)>=20 else np.nan,
-            "Ticker": ticker, "Signal date": str(past.index[-1])[:10], "Entry price": price,
-        }
-        row["Score"] = score_with_weights(row, BASE_WEIGHTS)
-        for horizon in horizons:
-            future = float(close.iloc[i+horizon])
-            row[f"Return {horizon}d %"] = (future/price-1)*100
-        rows.append(row)
-    return pd.DataFrame(rows)
-
-def backtest_metrics(frame, horizon):
-    col = f"Return {horizon}d %"
-    values = pd.to_numeric(frame[col], errors="coerce").dropna()
-    return {
-        "Signals": len(values),
-        "Positive return %": (values.gt(0).mean()*100) if len(values) else np.nan,
-        "Average return %": values.mean() if len(values) else np.nan,
-        "Median return %": values.median() if len(values) else np.nan,
-        "Negative return %": values.lt(0).mean()*100 if len(values) else np.nan,
-    }
-
-def evaluate_learned_holdout(frame, threshold):
-    """Train on early matured observations, then compare fixed/adaptive scores on later rows."""
-    if frame is None or len(frame)<60:
-        return None,"Need at least 60 sampled historical rows to make a time-separated comparison."
-    dates=pd.to_datetime(frame["Signal date"],errors="coerce").dropna().sort_values().reset_index(drop=True)
-    if len(dates)<60:
-        return None,"Not enough valid signal dates for a holdout comparison."
-    split_date=dates.iloc[int(len(dates)*0.70)]
-    # Exclude training signals whose 20-session outcomes could extend into the test period.
-    train_cutoff=split_date-pd.Timedelta(days=45)
-    weights,train_count,active,_=learned_weights(train_cutoff.strftime("%Y-%m-%d"))
-    test=frame[pd.to_datetime(frame["Signal date"],errors="coerce")>=split_date].copy()
-    if not active or train_count<30:
-        return None,f"Only {train_count} effective matured examples were available before the holdout date; at least 30 are needed."
-    if len(test)<20:
-        return None,"The later holdout portion has too few rows to compare reliably."
-    test["Fixed score"]=pd.to_numeric(test["Score"],errors="coerce")
-    test["Learned score"]=test.apply(lambda row:score_with_weights(row,weights),axis=1)
-    result_rows=[]
-    top_n=max(1,int(np.ceil(len(test)*0.20)))
-    for method,score_col in (("Fixed weights","Fixed score"),("Learned weights","Learned score")):
-        selections=[("At score threshold",test[test[score_col]>=threshold]),("Top 20% of scores",test.nlargest(top_n,score_col))]
-        for basis,selected in selections:
-            for horizon in (5,10,20,30):
-                values=pd.to_numeric(selected[f"Return {horizon}d %"],errors="coerce").dropna()
-                result_rows.append({"Scoring method":method,"Selection rule":basis,"Horizon (trading days)":horizon,
-                    "Signals":len(values),"Positive return %":values.gt(0).mean()*100 if len(values) else np.nan,
-                    "Average return %":values.mean() if len(values) else np.nan,
-                    "Median return %":values.median() if len(values) else np.nan,
-                    "False positive %":values.lt(0).mean()*100 if len(values) else np.nan})
-    weights_table=pd.DataFrame({"Indicator":FEATURES,"Base weight %":BASE_WEIGHTS*100,"Weights learned before holdout %":weights*100,"Change (percentage points)":(weights-BASE_WEIGHTS)*100})
-    return {"metrics":pd.DataFrame(result_rows),"weights":weights_table,"train_count":train_count,
-            "train_cutoff":train_cutoff.strftime("%Y-%m-%d"),"test_start":pd.Timestamp(split_date).strftime("%Y-%m-%d"),
-            "test_rows":len(test)},None
-
 
 MASTER_TICKERS = load_master_tickers()
 with st.sidebar:
-    page=st.radio("Page",["Single-Share Analysis","Automatic Share Scanner","Early-Mover Tracker","Prediction Lab","Phase 4 Backtest","Lower-Risk Investing","Value Investing","Momentum Trading","High-Growth Shares","Long-Term Investing","Portfolio Planner"])
+    page=st.radio("Page",["Single-Share Analysis","Automatic Share Scanner","Early-Mover Tracker","VPA Scanner","Prediction Lab","Lower-Risk Investing","Value Investing","Momentum Trading","High-Growth Shares","Long-Term Investing","Portfolio Planner"])
     st.divider()
     ticker_text=st.text_area("ASX tickers (commas or new lines)",", ".join(MASTER_TICKERS),height=160,
         help="Defaults to the bundled ASX company list. Edit or paste your own tickers if needed.")
@@ -1082,7 +756,7 @@ elif page=="Automatic Share Scanner":
     st.header(page); show_scan("Overall Score","Combined ranking: momentum 40%, value 30%, growth 30%, using available fields.")
 elif page=="Early-Mover Tracker":
     st.header("🚀 Early-Mover Tracker")
-    st.write("Ranks shares for early technical signs of a possible move: improving short-term momentum, expanding volume, price strength versus moving averages, and proximity to recent highs.")
+    st.write("Ranks shares for early technical signs of a possible move: improving short-term momentum, expanding volume, price strength versus moving averages, proximity to recent highs, and Volume Price Analysis evidence such as accumulation, no-supply tests and volume-confirmed breakouts.")
     st.warning("This is a screening heuristic, not a probability or prediction. A high score can still precede a sharp fall; small-cap shares can be illiquid and volatile.")
     if scan.empty:
         st.info("Run a full-market or quick promising-shares scan first. This tracker uses the latest scanner results.")
@@ -1096,17 +770,11 @@ elif page=="Early-Mover Tracker":
             st.info(f"Learning engine warming up: {learned_n}/30 completed 20-day outcomes. Original transparent weights remain in use until there is a minimum sample.")
         movers=movers[movers["Price"].notna()].sort_values("Early-Mover Score",ascending=False,na_position="last")
         movers["Signal Tier"]=np.select([movers["Early-Mover Score"]>=80,movers["Early-Mover Score"]>=65],["Priority review","Watch closely"],default="Lower priority")
-        st.caption("The score combines momentum, 50/200-day trend, volume, distance from highs, opening gaps, intraday range, close position within the day's range, and recent volatility. Missing fields are excluded and weights renormalised; the exact live weights and contributions appear below.")
+        st.caption("Score weights: 1-week momentum 15%, 1-month momentum 15%, 3-month momentum 10%, price vs 50-day average 10%, price vs 200-day average 10%, volume expansion 20%, distance from 20-day high 10%, and avoiding extreme short-term extension 8%, plus VPA score 12%, accumulation 4%, distribution-risk inverse 2%, and effort-versus-result 2%. Missing fields are excluded and weights renormalised. The adaptive learner can adjust these weights after enough completed outcomes.")
         st.caption(f"Latest scan: {st.session_state.get('scan_time','unknown')}. Use each share's Data Date to check freshness.")
-        cols=["Ticker","Company","Price","Early-Mover Score","Signal Tier","Return 1W %","Return 1M %","Return 3M %","Price vs 50D %","Above 200D %","Volume Change %","Distance from 20D High %","Market Cap","Data Date","Scan Status"]
+        cols=["Ticker","Company","Price","Early-Mover Score","Signal Tier","Return 1W %","Return 1M %","Return 3M %","Price vs 50D %","Above 200D %","Volume Change %","Distance from 20D High %","VPA Score","Accumulation Score","Distribution Risk","VPA Signal","Market Cap","Data Date","Scan Status"]
         st.dataframe(movers[[c for c in cols if c in movers.columns]].round(2),use_container_width=True,hide_index=True)
         st.download_button("Download early-mover rankings CSV",movers.to_csv(index=False).encode(),file_name="asx_early_mover_rankings.csv",mime="text/csv")
-        explain_ticker=st.selectbox("Explain a score",movers["Ticker"].tolist(),key="explain_early_mover")
-        explain_row=movers[movers["Ticker"]==explain_ticker].iloc[0]
-        factor_table,risk_notes=explain_early_mover_score(explain_row,learn_w)
-        st.markdown(f"**{explain_ticker} score: {explain_row['Early-Mover Score']:.1f}/100** — indicator scores are combined using the weights shown. This is a ranking score, not a likelihood.")
-        st.dataframe(factor_table,use_container_width=True,hide_index=True)
-        st.write("**Factors that may weaken the setup:**", "; ".join(risk_notes) if risk_notes else "No major technical warning from these indicators; missing announcements, dilution, liquidity, halts, and sudden news can still reverse a move.")
         prediction_selection=st.multiselect("Record these as formal predictions",movers["Ticker"].tolist(),key="prediction_select")
         if st.button("Save selected predictions to history",type="primary",disabled=not prediction_selection):
             chosen=movers[movers["Ticker"].isin(prediction_selection)].copy()
@@ -1145,9 +813,30 @@ elif page=="Early-Mover Tracker":
             st.caption("No shares tracked yet. Select candidates above and save them.")
         st.info("The tracker currently lives in Streamlit session state. Download its CSV to keep a copy; it may reset if the app session restarts. Automatic ASX-announcement/catalyst analysis is a later step.")
 
+elif page=="VPA Scanner":
+    st.header("📊 Volume Price Analysis Scanner")
+    st.write("Ranks ASX shares using the relationship between daily price spread, candle close location and trading volume. It looks for possible accumulation, no-supply tests, stopping volume, volume-confirmed breakouts, distribution and upthrusts.")
+    st.warning("VPA signals are heuristic interpretations of OHLCV data. They cannot identify who is trading or prove institutional accumulation/distribution. Thinly traded ASX shares, announcements and stale data can distort signals.")
+    if scan.empty:
+        st.info("Run a full-market or quick promising-shares scan first. VPA uses the same downloaded price history.")
+    else:
+        vpa=scan[scan["Price"].notna()].copy()
+        vpa=vpa.sort_values(["VPA Score","Accumulation Score"],ascending=False,na_position="last")
+        a,b,c=st.columns(3)
+        a.metric("Shares with VPA score",int(vpa["VPA Score"].notna().sum()))
+        b.metric("Possible accumulation (60+)",int((vpa["Accumulation Score"]>=60).sum()))
+        c.metric("Distribution warnings",int((vpa["Distribution Risk"]>=35).sum()))
+        st.caption("VPA score combines a 20-session directional-volume/range assessment, effort-versus-result and latest-bar event flags. It is a research ranking, not a probability or buy/sell signal.")
+        cols=["Ticker","Company","Price","VPA Score","Accumulation Score","Distribution Risk","Effort Result Score","VPA Signal","VPA Notes","Volume Change %","Return 1W %","Return 1M %","Data Date"]
+        st.dataframe(vpa[[k for k in cols if k in vpa]].round(2),use_container_width=True,hide_index=True)
+        st.download_button("Download VPA rankings CSV",vpa.to_csv(index=False).encode(),file_name="asx_vpa_rankings.csv",mime="text/csv")
+        st.subheader("How to interpret the signals")
+        st.markdown("- **Possible accumulation:** directional volume pressure and firm closes suggest demand may be absorbing supply.\n- **No supply:** a low-volume decline with a relatively narrow spread may indicate reduced selling interest.\n- **Stopping volume:** heavy volume during a decline with a recovery from the lows may indicate demand absorbing selling.\n- **Volume-confirmed breakout:** close above the prior 20-session high with volume at least 1.5× its 20-day average.\n- **Distribution / upthrust:** heavy volume with weak closes or a failed move above recent highs can warn of supply.")
+        st.info("The Early-Mover Score now includes VPA features. The Prediction Lab learns their historical relationship with subsequent 20-day returns alongside the original indicators. Existing Phase 3 prediction history remains readable; older records simply have no VPA feature values.")
+
 elif page=="Prediction Lab":
     st.header("🧠 Prediction Lab — accuracy and learning")
-    st.write("Saved predictions are measured after 5, 10, 20, 30 and 60 subsequent trading sessions. The learning engine combines completed live predictions with completed 20-day observations from Phase 4 historical backtests to adjust indicator weights for future Early-Mover scores.")
+    st.write("Every saved prediction is measured against its entry close after 5, 20 and 60 subsequent trading sessions. The learning engine reviews completed 20-day outcomes to estimate which signals have been more useful, including the new VPA features. VPA values are saved with each new prediction so their contribution can be evaluated.")
     st.warning("This is a research experiment, not a proven forecasting model. It needs a meaningful number of saved predictions across different market conditions. It does not place trades.")
     a,b=st.columns([1,3])
     if a.button("Refresh outcomes from Yahoo Finance",type="primary"):
@@ -1155,26 +844,61 @@ elif page=="Prediction Lab":
             count=refresh_prediction_outcomes()
         st.success(f"Updated outcomes for {count} prediction(s).")
     con=db_connect(); predictions=pd.read_sql_query("SELECT * FROM predictions ORDER BY signal_date DESC,id DESC",con); con.close()
-    render_learning_dashboard()
     if predictions.empty:
         st.info("No predictions recorded yet. Go to Early-Mover Tracker, select shares and choose 'Save selected predictions to history'.")
     else:
         total=len(predictions)
+        # Same-prediction comparison: original eight-feature score vs VPA-enhanced
+        # 12-feature score, using only rows that actually contain saved VPA values.
+        compare_rows=[]
+        original_weights=np.array([0.15,0.15,0.10,0.10,0.10,0.20,0.10,0.10],dtype=float)
+        for _,pr in predictions.iterrows():
+            try: parts=json.loads(pr.get("components_json") or "[]")
+            except Exception: parts=[]
+            outcome=num(pr.get("return_20d"))
+            if len(parts)>=12 and outcome is not None and any(x is not None for x in parts[8:12]):
+                old=[(i,num(v)) for i,v in enumerate(parts[:8]) if num(v) is not None]
+                new=[(i,num(v)) for i,v in enumerate(parts[:12]) if num(v) is not None]
+                old_score=(sum(v*original_weights[i] for i,v in old)/sum(original_weights[i] for i,v in old)) if old else np.nan
+                new_score=(sum(v*BASE_WEIGHTS[i] for i,v in new)/sum(BASE_WEIGHTS[i] for i,v in new)) if new else np.nan
+                compare_rows.append({"Original score":old_score,"VPA-enhanced score":new_score,"20-day return %":outcome})
+        if len(compare_rows)>=10:
+            cmp=pd.DataFrame(compare_rows)
+            st.subheader("Does VPA improve the ranking? — same-prediction comparison")
+            st.caption(f"Compares {len(cmp)} completed predictions that contain saved VPA data. Both scores are recalculated with their original baseline weights; adaptive weights are excluded here to keep the comparison interpretable.")
+            summary=[]
+            for label in ["Original score","VPA-enhanced score"]:
+                pairs=cmp[[label,"20-day return %"]].dropna()
+                corr=pairs.iloc[:,0].corr(pairs.iloc[:,1]) if len(pairs)>=3 and pairs.iloc[:,0].nunique()>1 else np.nan
+                top=pairs[pairs[label]>=pairs[label].quantile(.75)]
+                summary.append({"Model":label,"Score / return correlation":round(corr,3) if pd.notna(corr) else np.nan,"Top-quartile predictions":len(top),"Top-quartile positive rate %":round((top["20-day return %"]>0).mean()*100,1) if len(top) else np.nan,"Top-quartile average return %":round(top["20-day return %"].mean(),2) if len(top) else np.nan})
+            st.dataframe(pd.DataFrame(summary),hide_index=True,use_container_width=True)
+            st.caption("Treat this as an early diagnostic, not proof of improvement. Use a larger sample across different market conditions and avoid tuning on the same observations used to judge performance.")
+        elif compare_rows:
+            st.info(f"VPA comparison warming up: {len(compare_rows)}/10 completed predictions with VPA data. More completed 20-day outcomes are needed.")
         st.subheader("Prediction performance")
-        metrics=st.columns(6); metrics[0].metric("Predictions recorded",total)
-        for col,h in zip(metrics[1:],(5,10,20,30,60)):
+        metrics=st.columns(4); metrics[0].metric("Predictions recorded",total)
+        for col,h in zip(metrics[1:],(5,20,60)):
             vals=pd.to_numeric(predictions[f"return_{h}d"],errors="coerce").dropna()
             wins=int((vals>0).sum()); count=len(vals)
             col.metric(f"{h}-day positive rate",f"{wins/count*100:.1f}%" if count else "Not ready",help=f"{wins} positive outcomes out of {count} completed predictions")
         summaries=[]
-        for h in (5,10,20,30,60):
+        for h in (5,20,60):
             vals=pd.to_numeric(predictions[f"return_{h}d"],errors="coerce").dropna()
             summaries.append({"Horizon":f"{h} trading days","Completed":len(vals),"Positive %":round((vals>0).mean()*100,1) if len(vals) else np.nan,"Average return %":round(vals.mean(),2) if len(vals) else np.nan,"Median return %":round(vals.median(),2) if len(vals) else np.nan})
         st.dataframe(pd.DataFrame(summaries),use_container_width=True,hide_index=True)
+        st.subheader("What the system is learning")
+        weights,n,active,corr=learned_weights()
+        if active:
+            learned=pd.DataFrame({"Indicator":FEATURES,"Original weight %":BASE_WEIGHTS*100,"Learned weight %":weights*100,"Correlation with 20-day return":corr})
+            st.dataframe(learned.round(3),use_container_width=True,hide_index=True)
+            st.caption("Correlations are descriptive, not causal. The model blends them conservatively with original weights and only activates after 30 completed 20-day observations.")
+        else:
+            st.info(f"The adaptive scoring is not active yet. {n}/30 completed 20-day outcomes are available. Until then, the original weights are used.")
         st.subheader("Individual predictions")
-        view_cols=["ticker","company","signal_date","entry_price","base_score","price_5d","return_5d","price_10d","return_10d","price_20d","return_20d","price_30d","return_30d","price_60d","return_60d"]
+        view_cols=["ticker","company","signal_date","entry_price","base_score","price_5d","return_5d","price_20d","return_20d","price_60d","return_60d"]
         view=predictions[view_cols].copy()
-        view.columns=["Ticker","Company","Signal date","Entry price","Signal score","5d price","5d return %","10d price","10d return %","20d price","20d return %","30d price","30d return %","60d price","60d return %"]
+        view.columns=["Ticker","Company","Signal date","Entry price","Signal score","5d price","5d return %","20d price","20d return %","60d price","60d return %"]
         st.dataframe(view.round(3),use_container_width=True,hide_index=True)
         st.download_button("Download complete prediction history CSV",predictions.to_csv(index=False).encode(),file_name="asx_prediction_history.csv",mime="text/csv")
         if st.button("Delete all saved prediction history",type="secondary"):
@@ -1185,131 +909,6 @@ elif page=="Prediction Lab":
                 con=db_connect(); con.execute("DELETE FROM predictions"); con.commit(); con.close()
                 st.session_state["confirm_delete_predictions"]=False; st.rerun()
     st.caption(f"Local database: {DB_PATH.name}. Streamlit Community Cloud local storage may be reset by app rebuilds or restarts. Download the CSV backup regularly; a later upgrade can connect durable cloud storage.")
-    render_database_backup("prediction_lab")
-
-elif page=="Phase 4 Backtest":
-    st.header("🧪 Phase 4 — Historical Backtest & Diagnostics")
-    st.write("Replay the Phase 3 Early-Mover scoring rules at past dates, compare them with later prices, and add completed historical observations to the learning engine. Those past results then inform the adaptive weights used for future live Early-Mover scores.")
-    st.warning("This downloads maximum available Yahoo Finance adjusted OHLCV history for current ASX codes, in resumable batches. It cannot include the full history of delisted companies or guarantee 50 years for newer listings. It evaluates momentum, trend, volume, opening gaps, daily range, close location and volatility; historical announcements and fundamentals are not in this free-data backtest. Fees, spreads and market impact are excluded, and historical adjustments may be revised. Results are descriptive, not proof of causes or future performance.")
-    scope=st.radio("Backtest universe",["Entire listed universe","Selected shares"],horizontal=True,key="p4_scope")
-    if scope=="Entire listed universe":
-        backtest_codes=MASTER_TICKERS
-        st.caption(f"Using all {len(backtest_codes):,} codes in the bundled current ASX list. This is not a historical list of every company that was ever listed.")
-    else:
-        backtest_codes=st.multiselect("Select shares for historical test",MASTER_TICKERS,default=MASTER_TICKERS[:min(10,len(MASTER_TICKERS))],key="p4_backtest_codes")
-    interval=st.select_slider("Signal spacing (trading days)",[1,5,10,20],value=5,key="p4_interval")
-    batch_size=st.select_slider("Shares to fetch per batch",[10,20,30,50,75],value=20,key="p4_batch_size")
-    signal_threshold=st.slider("Score treated as a signal",40,90,65,key="p4_threshold")
-    job_key,next_index=batch_job_state(backtest_codes,interval)
-    done=min(next_index,len(backtest_codes))
-    st.progress(done/max(1,len(backtest_codes)),text=f"Universe progress: {done:,} of {len(backtest_codes):,} shares processed")
-    con=db_connect()
-    cached_tickers,cached_rows=con.execute("SELECT COUNT(DISTINCT ticker),COUNT(*) FROM historical_prices").fetchone()
-    cached_codes={row[0] for row in con.execute("SELECT DISTINCT ticker FROM historical_prices").fetchall()}
-    con.close()
-    cached_in_universe=len(set(backtest_codes)&cached_codes)
-    st.caption(f"This run has attempted {done:,}/{len(backtest_codes):,} codes; {cached_in_universe:,} have cached history. The local cache contains {cached_rows:,} daily OHLCV records across {cached_tickers:,} tickers. Progress counts attempted codes, so check the unavailable-share list too. Data and progress are in SQLite; back it up before replacing the app.")
-    col_auto,col_single,col_reset=st.columns(3)
-    run_all=col_auto.button("Run all remaining batches automatically",type="primary",key="p4_run_all",disabled=(done>=len(backtest_codes) or not backtest_codes))
-    run_batch=col_single.button(f"Run one batch ({min(batch_size,max(0,len(backtest_codes)-done))})",key="p4_run_batch",disabled=(done>=len(backtest_codes) or not backtest_codes))
-    reset_batch=col_reset.button("Restart this backtest run",key="p4_reset_batch",disabled=(done==0))
-    st.caption("The automatic run may take a long time. Progress and data are saved after each batch; if Streamlit interrupts it, return here and click the automatic button again to resume.")
-    if reset_batch:
-        set_batch_job_index(job_key,backtest_codes,interval,0)
-        st.rerun()
-    if run_all:
-        current=done
-        batch_total=int(np.ceil((len(backtest_codes)-current)/batch_size))
-        overall=st.progress(0,text=f"Starting {batch_total} remaining batches…")
-        failed_codes=[]; batch_number=0
-        while current<len(backtest_codes):
-            batch_number+=1
-            batch_codes=backtest_codes[current:min(current+batch_size,len(backtest_codes))]
-            failed_codes.extend(process_historical_batch(batch_codes,job_key,interval,batch_number,batch_total))
-            current=min(current+len(batch_codes),len(backtest_codes))
-            set_batch_job_index(job_key,backtest_codes,interval,current)
-            overall.progress(current/max(1,len(backtest_codes)),text=f"Completed {current:,} of {len(backtest_codes):,} shares")
-        overall.empty()
-        st.session_state["p4_backtest_threshold"]=signal_threshold
-        st.success(f"Finished the full run. {len(failed_codes)} ticker(s) had unavailable or insufficient history; see the failed-share list below.")
-        st.rerun()
-    elif run_batch:
-        batch_codes=backtest_codes[done:min(done+batch_size,len(backtest_codes))]
-        process_historical_batch(batch_codes,job_key,interval)
-        next_index=min(done+len(batch_codes),len(backtest_codes))
-        set_batch_job_index(job_key,backtest_codes,interval,next_index)
-        st.session_state["p4_backtest_threshold"]=signal_threshold
-        st.rerun()
-    bt=load_historical_learning(backtest_codes)
-    if not bt.empty:
-        cutoff=st.session_state.get("p4_backtest_threshold",signal_threshold)
-        signals=bt[pd.to_numeric(bt["Score"],errors="coerce")>=cutoff].copy()
-        total_rows=bt.attrs.get("total_observations",len(bt))
-        sample_text=f"Showing a representative sample of {len(bt):,} from {total_rows:,} stored observations." if bt.attrs.get("display_sampled",False) else f"Showing all {total_rows:,} stored observations."
-        st.caption(f"{sample_text} {len(signals):,} displayed rows met the score threshold of {cutoff}. Evaluation uses original fixed weights to avoid look-ahead. All completed monthly learning observations train future live Early-Mover scores.")
-        st.subheader("Accuracy by timeframe")
-        horizon_rows=[]
-        for horizon in (5,10,20,30):
-            metrics=backtest_metrics(signals,horizon)
-            horizon_rows.append({"Timeframe (trading days)":horizon,**{k:(round(v,2) if pd.notna(v) and isinstance(v,(int,float,np.integer,np.floating)) else v) for k,v in metrics.items()}})
-        st.dataframe(pd.DataFrame(horizon_rows),use_container_width=True,hide_index=True)
-        horizon=st.selectbox("Diagnostic timeframe",[5,10,20,30],index=2,key="p4_horizon")
-        retcol=f"Return {horizon}d %"
-        st.subheader("Calibration by score bucket")
-        work=bt.copy()
-        work["Score bucket"]=pd.cut(pd.to_numeric(work["Score"],errors="coerce"),[-np.inf,49,64,79,np.inf],labels=["0–49","50–64","65–79","80–100"])
-        bucket=work.groupby("Score bucket",observed=False).agg(
-            Samples=(retcol,"count"),Positive_return_rate=(retcol,lambda x:round((x>0).mean()*100,1)),
-            Mean_return=(retcol,"mean"),Median_return=(retcol,"median"),False_positive_rate=(retcol,lambda x:round((x<0).mean()*100,1))).reset_index()
-        bucket.columns=["Score bucket","Samples","Positive return %","Average return %","Median return %","False positive %"]
-        st.dataframe(bucket.round(2),use_container_width=True,hide_index=True)
-        st.caption("A false positive is a score at or above the selected threshold followed by a negative return at the chosen timeframe. Calibration is descriptive: score bands are not probabilities.")
-        st.subheader("What went wrong or right?")
-        st.write("**False positives / weakest signal outcomes**")
-        st.dataframe(signals.sort_values(retcol).head(12)[["Ticker","Signal date","Score","Entry price",retcol]],use_container_width=True,hide_index=True)
-        st.write("**Best signal outcomes**")
-        st.dataframe(signals.sort_values(retcol,ascending=False).head(12)[["Ticker","Signal date","Score","Entry price",retcol]],use_container_width=True,hide_index=True)
-        st.subheader("Indicator diagnostics")
-        st.caption("These correlations compare trailing indicator values with the selected forward return in this sample. They are exploratory and do not establish cause.")
-        diagnostics=[]
-        for feature in FEATURES:
-            if feature in work:
-                pair=work[[feature,retcol]].apply(pd.to_numeric,errors="coerce").dropna()
-                corr=pair.iloc[:,0].corr(pair.iloc[:,1]) if len(pair)>=10 and pair.iloc[:,0].nunique()>1 else np.nan
-                diagnostics.append({"Indicator":feature,"Sample count":len(pair),"Correlation with forward return":corr})
-        st.dataframe(pd.DataFrame(diagnostics).round(3),use_container_width=True,hide_index=True)
-        st.download_button("Download displayed backtest rows CSV",bt.to_csv(index=False).encode(),file_name="asx_phase4_historical_backtest_sample.csv",mime="text/csv")
-        st.subheader("Did learned weights help on later, unseen history?")
-        st.write("This check trains weights only on matured outcomes from earlier dates, leaves a 45-day gap, then compares fixed and learned scores on the later holdout period. It tests whether the indicators ranked the later sample better; it cannot guarantee future performance.")
-        holdout_key=(tuple(sorted(backtest_codes)),int(interval),int(cutoff))
-        if st.button("Run learned-versus-fixed holdout check",key="p4_holdout_check"):
-            holdout_result,holdout_error=evaluate_learned_holdout(bt,cutoff)
-            st.session_state["p4_holdout_result"]={"key":holdout_key,"result":holdout_result,"error":holdout_error}
-        saved_holdout=st.session_state.get("p4_holdout_result")
-        if saved_holdout and saved_holdout.get("key")==holdout_key:
-            if saved_holdout.get("error"):
-                st.info(saved_holdout["error"])
-            else:
-                holdout=saved_holdout["result"]
-                st.caption(f"Trained on {holdout['train_count']:,} effective examples dated before {holdout['train_cutoff']}; evaluated {holdout['test_rows']:,} displayed historical rows from {holdout['test_start']} onward.")
-                st.dataframe(holdout["metrics"].round(2),use_container_width=True,hide_index=True)
-                st.markdown("**Weights learned from the earlier period**")
-                st.dataframe(holdout["weights"].round(3),use_container_width=True,hide_index=True)
-                st.caption("Look for learned weights to improve positive-return rates and average returns on the later test rows, especially under the equal-sized Top 20% comparison. If results are mixed or worse, the learning has not shown a reliable improvement in this test.")
-        elif not saved_holdout:
-            st.caption("Run this check after the universe has enough saved history. It uses a time split and does not train on the later holdout outcomes.")
-        else:
-            st.caption("The selected universe, spacing, or threshold changed. Run the holdout check again for the current selection.")
-    else:
-        st.info("Run the next download batch. Each share's maximum available daily history is cached locally, and completed historical observations are added to the learning pool.")
-    con=db_connect()
-    failures_df=pd.read_sql_query("SELECT ticker AS Ticker,reason AS Reason FROM historical_batch_failures WHERE job_key=? ORDER BY ticker",con,params=(job_key,))
-    con.close()
-    failures=failures_df.to_dict("records")
-    if failures:
-        with st.expander(f"Unavailable shares ({len(failures)})"):
-            st.dataframe(pd.DataFrame(failures),use_container_width=True,hide_index=True)
-    render_database_backup("phase4_backtest")
 
 elif page=="Lower-Risk Investing":
     st.header(page); show_scan("Lower-Risk Score","A relative screen for shares above their 200-day average and without a severe monthly decline. These are not guaranteed to be safe.")
@@ -1338,5 +937,5 @@ elif page=="Portfolio Planner":
 
 st.divider()
 st.subheader("Data and limitations")
-st.markdown("- Data provider: Yahoo Finance via yfinance; availability, freshness and definitions vary.\n- The bundled company file contains 1,810 current ASX codes; it is not a historical record of delisted companies or past ASX membership.\n- Maximum available history varies by ticker; newer listings have shorter histories. Small caps may have missing prices, low liquidity, wide spreads and high volatility.\n- Scores are rule-based comparisons, not probabilities or buy/sell recommendations.\n- Historical correlations do not show that a factor caused a price rise. Verify ASX announcements, audited reports, debt, cash flow, dilution, liquidity and trading halts.\n- The app does not connect to a broker or place trades.")
+st.markdown("- Data provider: Yahoo Finance via yfinance; availability, freshness and definitions vary.\n- The built-in list is a sample, not the full ASX. Paste your own ticker list for wider coverage.\n- Small caps may have missing data, low liquidity, wide spreads and high volatility.\n- Scores are rule-based comparisons, not predictions, probabilities, or buy/sell recommendations.\n- Verify ASX announcements, audited reports, debt, cash flow, dilution, liquidity and trading halts.\n- The app does not connect to a broker or place trades.")
 st.caption("Personal-use research prototype. Not affiliated with QAV, Stock Doctor, Yahoo Finance or ASX.")
