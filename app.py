@@ -946,9 +946,92 @@ def evaluate_learned_holdout(frame, threshold):
 
 
 
+# Sector baskets are illustrative, equal-weighted groups of ASX-listed shares,
+# not official GICS sector indices. Survivorship and selection bias apply.
+SECTOR_BASKETS = {
+    "Materials & Mining": ["BHP", "RIO", "FMG", "S32", "MIN"],
+    "Financials": ["CBA", "NAB", "WBC", "ANZ", "MQG"],
+    "Energy": ["WDS", "STO", "ORG", "WHC", "BPT"],
+    "Healthcare": ["CSL", "RMD", "COH", "SHL", "RHC"],
+    "Technology": ["XRO", "WTC", "TNE", "NXT", "CPU"],
+    "Consumer Discretionary": ["WES", "JBH", "HVN", "ALL", "FLT"],
+    "Consumer Staples": ["WOW", "COL", "A2M", "BGA", "TWE"],
+    "Industrials": ["QAN", "TCL", "BXB", "REH", "ALQ"],
+    "Real Estate": ["GMG", "SCG", "VCX", "GPT", "MGR"],
+    "Communication Services": ["TLS", "REA", "CAR", "TPG", "SEK"],
+    "Utilities": ["AGL", "APA", "ORG", "MEZ", "SKI"],
+}
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def sector_price_history(symbols):
+    out = {}
+    for symbol in symbols:
+        try:
+            h = yf.Ticker(symbol).history(period="2y", auto_adjust=True)
+            if h is not None and not h.empty and "Close" in h:
+                close = h["Close"].dropna()
+                if len(close) >= 6:
+                    out[symbol] = close
+        except Exception:
+            pass
+    return out
+
+def sector_return(series, sessions):
+    if series is None or len(series) <= sessions:
+        return None
+    first, last = float(series.iloc[-sessions-1]), float(series.iloc[-1])
+    return (last / first - 1) * 100 if first > 0 else None
+
+def sector_performance_page():
+    st.header("Sector Performance")
+    st.write("Compare representative ASX sector baskets with the S&P/ASX 200 price index (^AXJO). Identify strong and weak sectors before reviewing individual shares.")
+    horizon = st.selectbox("Comparison period", ["1 week", "1 month", "3 months", "6 months", "12 months"], index=2)
+    sessions = {"1 week": 5, "1 month": 21, "3 months": 63, "6 months": 126, "12 months": 252}[horizon]
+    if st.button("Refresh sector data", key="refresh_sector"):
+        sector_price_history.clear()
+    symbols = ["^AXJO"] + sorted({f"{t}.AX" for basket in SECTOR_BASKETS.values() for t in basket})
+    with st.spinner("Fetching sector share prices..."):
+        prices = sector_price_history(tuple(symbols))
+    benchmark = sector_return(prices.get("^AXJO"), sessions)
+    if benchmark is None:
+        st.warning("The ASX 200 benchmark has insufficient data for this period. Try a shorter period or refresh later.")
+        return
+    st.metric("ASX 200 benchmark return", f"{benchmark:+.2f}%", help="Price index only; excludes dividends")
+    records = []
+    for sector, tickers in SECTOR_BASKETS.items():
+        members = []
+        for t in tickers:
+            ret = sector_return(prices.get(f"{t}.AX"), sessions)
+            if ret is not None:
+                members.append((t, ret))
+        if not members:
+            continue
+        avg = float(np.mean([r for _, r in members]))
+        records.append({"Sector": sector, "Sector return %": round(avg, 2), "ASX 200 return %": round(benchmark, 2), "Relative performance (pp)": round(avg-benchmark, 2), "Outperforming stocks": sum(r > benchmark for _, r in members), "Stocks with data": len(members), "Basket size": len(tickers), "Status": "Outperforming" if avg > benchmark else "Underperforming"})
+    if not records:
+        st.warning("No usable sector prices returned. Try refreshing later.")
+        return
+    df = pd.DataFrame(records).sort_values("Relative performance (pp)", ascending=False)
+    a, b, c = st.columns(3)
+    a.metric("Sectors beating ASX 200", int((df["Relative performance (pp)"] > 0).sum()))
+    b.metric("Sectors lagging ASX 200", int((df["Relative performance (pp)"] < 0).sum()))
+    c.metric("Strongest basket", df.iloc[0]["Sector"])
+    st.subheader("Sector performance relative to ASX 200")
+    st.bar_chart(df.set_index("Sector")["Relative performance (pp)"], horizontal=True)
+    st.dataframe(df, hide_index=True, use_container_width=True)
+    chosen = st.selectbox("Inspect a sector's individual shares", df["Sector"].tolist())
+    details = []
+    for t in SECTOR_BASKETS[chosen]:
+        r = sector_return(prices.get(f"{t}.AX"), sessions)
+        details.append({"Ticker": t, "Return %": round(r, 2) if r is not None else None, "Vs ASX 200 (pp)": round(r-benchmark, 2) if r is not None else None})
+    st.dataframe(pd.DataFrame(details), hide_index=True, use_container_width=True)
+    st.download_button("Download sector comparison CSV", df.to_csv(index=False).encode(), file_name="asx_sector_comparison.csv", mime="text/csv")
+    st.caption("Method: simple average of available constituent price returns, equal weight per stock. Sector baskets are selected examples, NOT comprehensive ASX sectors or investable sector indices. Constituents can overlap, and missing stocks are excluded. 12 months requires 253 price observations; some stocks may lack data. Benchmark excludes dividends. This is a sector screen, not proof of future performance.")
+
+
 MASTER_TICKERS = load_master_tickers()
 with st.sidebar:
-    page=st.radio("Page",["Single-Share Analysis","Automatic Share Scanner","Early-Mover Tracker","VPA Scanner","Prediction Lab","Phase 4 Backtest","Lower-Risk Investing","Value Investing","Momentum Trading","High-Growth Shares","Long-Term Investing","Portfolio Planner"])
+    page=st.radio("Page",["Single-Share Analysis","Automatic Share Scanner","Early-Mover Tracker","VPA Scanner","Prediction Lab","Phase 4 Backtest","Sector Performance","Lower-Risk Investing","Value Investing","Momentum Trading","High-Growth Shares","Long-Term Investing","Portfolio Planner"])
     st.divider()
     ticker_text=st.text_area("ASX tickers (commas or new lines)",", ".join(MASTER_TICKERS),height=160,
         help="Defaults to the bundled ASX company list. Edit or paste your own tickers if needed.")
@@ -1498,6 +1581,9 @@ elif page=="Phase 4 Backtest":
         with st.expander(f"Unavailable shares ({len(failures)})"):
             st.dataframe(pd.DataFrame(failures),use_container_width=True,hide_index=True)
     render_database_backup("phase4_backtest")
+
+elif page=="Sector Performance":
+    sector_performance_page()
 
 elif page=="Lower-Risk Investing":
     st.header(page); show_scan("Lower-Risk Score","A relative screen for shares above their 200-day average and without a severe monthly decline. These are not guaranteed to be safe.")
