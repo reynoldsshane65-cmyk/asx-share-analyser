@@ -245,11 +245,11 @@ def download_price_batches(tickers, period, batch_size=30):
 def refresh_vpa_results(frame, period="1y"):
     """Backfill VPA from OHLCV without rerunning fundamentals or losing prior scores."""
     updated = frame.copy()
-    fields = ["VPA Score", "Accumulation Score", "Distribution Risk",
+    fields = ["VPA Score", "Accumulation Score", "Distribution Risk", "20D Distribution Risk",
               "Effort Result Score", "VPA Signal", "VPA Notes"]
     for field in fields:
         if field not in updated.columns:
-            updated[field] = np.nan if field.endswith("Score") or field == "Distribution Risk" else ""
+            updated[field] = np.nan if field.endswith("Score") or "Distribution Risk" in field else ""
     symbols = updated.loc[updated["Price"].notna(), "Ticker"].astype(str).tolist()
     bar = st.progress(0, text="Downloading OHLCV data for VPA…")
     for offset in range(0, len(symbols), 30):
@@ -261,7 +261,7 @@ def refresh_vpa_results(frame, period="1y"):
                 result = calculate_vpa(history)
             except Exception as exc:
                 result = {"VPA Score": np.nan, "Accumulation Score": np.nan,
-                          "Distribution Risk": np.nan, "Effort Result Score": np.nan,
+                          "Distribution Risk": np.nan, "20D Distribution Risk": np.nan, "Effort Result Score": np.nan,
                           "VPA Signal": "VPA calculation error",
                           "VPA Notes": f"{type(exc).__name__}: {str(exc)[:150]}"}
             mask = updated["Ticker"].astype(str).eq(symbol)
@@ -281,7 +281,7 @@ def calculate_vpa(history):
     """
     empty = {
         "VPA Score": np.nan, "Accumulation Score": np.nan,
-        "Distribution Risk": np.nan, "Effort Result Score": np.nan,
+        "Distribution Risk": np.nan, "20D Distribution Risk": np.nan, "Effort Result Score": np.nan,
         "VPA Signal": "Insufficient OHLCV data", "VPA Notes": "Fewer than 30 usable OHLCV sessions; check Yahoo history, OHLC columns and trading volume."
     }
     if history is None or history.empty or len(history) < 30:
@@ -335,6 +335,34 @@ def calculate_vpa(history):
     absret=abs(today_ret)
     effort=float(np.clip(50 + (min(absret,5)*8 if ratio and ratio>=1.3 else 0) - (max(0,(ratio or 0)-1.5)*12 if absret<1.0 else 0),0,100))
     dist_risk=float(np.clip((35 if distribution else 0)+(40 if upthrust else 0)+(15 if no_demand else 0)+(10 if today_ret<0 and ratio and ratio>=1.5 and today_loc<.4 else 0),0,100))
+    # Persistent distribution: evaluate the same four warnings for each of
+    # the latest 20 completed daily bars, with more weight on recent sessions.
+    # Use preceding 20 bars for reference highs and average volume to avoid
+    # look-ahead bias; a minimum of 30 usable sessions is required above.
+    prior_avg = v.shift(1).rolling(20, min_periods=10).mean()
+    rolling_ratio = (v / prior_avg.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+    prior_highs = h.shift(1).rolling(20, min_periods=10).max()
+    prior_max_close = c.shift(1).rolling(20, min_periods=10).max()
+    median_spreads = spread.shift(1).rolling(20, min_periods=10).median()
+    possible_dist = ((rolling_ratio >= 1.8) & (close_loc < .4) &
+                     ((ret <= .5) | (c >= prior_max_close * .95)))
+    failed_breakout = ((h > prior_highs) & (c < prior_highs) &
+                       (close_loc < .45) & (rolling_ratio >= 1.3))
+    weak_demand = ((ret > 0) & (rolling_ratio < .75) &
+                   (spread <= median_spreads * 1.15))
+    bearish_volume = ((ret < 0) & (rolling_ratio >= 1.5) & (close_loc < .4))
+    daily_risk = (possible_dist.astype(float) * 35 +
+                  failed_breakout.astype(float) * 40 +
+                  weak_demand.astype(float) * 15 +
+                  bearish_volume.astype(float) * 10).clip(0, 100)
+    last20 = daily_risk.tail(20).to_numpy(dtype=float)
+    weights = np.arange(1, len(last20) + 1, dtype=float)
+    # Recency-weighted mean plus persistence penalty for repeated warning days.
+    # Heuristic score (not a calibrated probability).
+    persistent_days = int(np.count_nonzero(last20 >= 35))
+    dist_risk_20d = float(np.clip(
+        np.average(last20, weights=weights) + min(30, persistent_days * 4),
+        0, 100))
     event_bonus=(12 if no_supply else 0)+(18 if stopping else 0)+(18 if breakout else 0)
     event_penalty=(18 if no_demand else 0)+(25 if upthrust else 0)+(18 if distribution else 0)
     vpa_score=float(np.clip(accumulation*.55+effort*.20+25+event_bonus-event_penalty,0,100))
@@ -349,7 +377,7 @@ def calculate_vpa(history):
         signals.append("No strong latest-bar event")
     notes=f"20-session accumulation {accumulation:.0f}/100; latest volume {ratio:.2f}x 20-day average" if ratio is not None and np.isfinite(ratio) else f"20-session accumulation {accumulation:.0f}/100; volume baseline unavailable"
     return {"VPA Score":round(vpa_score,1),"Accumulation Score":round(accumulation,1),
-            "Distribution Risk":round(dist_risk,1),"Effort Result Score":round(effort,1),
+            "Distribution Risk":round(dist_risk,1),"20D Distribution Risk":round(dist_risk_20d,1),"Effort Result Score":round(effort,1),
             "VPA Signal":"; ".join(signals),"VPA Notes":notes}
 
 
@@ -393,7 +421,7 @@ def run_scan(tickers, period):
                 "200D Average": np.nan, "Above 200D %": np.nan,
                 "Volume Change %": np.nan, "Market Cap": np.nan,
                 "P/E": np.nan, "Revenue Growth %": np.nan,
-                "Profit Margin %": np.nan, "VPA Score": np.nan, "Accumulation Score": np.nan, "Distribution Risk": np.nan, "Effort Result Score": np.nan, "VPA Signal": "No price data", "VPA Notes": "", "Fundamentals Status": "Not fetched (no prices)",
+                "Profit Margin %": np.nan, "VPA Score": np.nan, "Accumulation Score": np.nan, "Distribution Risk": np.nan, "20D Distribution Risk": np.nan, "Effort Result Score": np.nan, "VPA Signal": "No price data", "VPA Notes": "", "Fundamentals Status": "Not fetched (no prices)",
                 "Data Date": "", "Scan Status": status
             })
             progress.progress(0.15 + 0.85 * (i + 1) / total, text=f"Checking {sym} ({i+1}/{total})…")
@@ -1136,7 +1164,8 @@ def apply_custom_score_filters(frame, key_prefix):
         ("Early-Mover Score", "EMS — minimum", 70, "min"),
         ("VPA Score", "VPA — minimum", 65, "min"),
         ("Accumulation Score", "Accumulation — minimum", 60, "min"),
-        ("Distribution Risk", "Distribution risk — maximum", 35, "max"),
+        ("Distribution Risk", "Today distribution risk — maximum", 35, "max"),
+        ("20D Distribution Risk", "20-day distribution risk — maximum", 35, "max"),
         ("Effort Result Score", "Effort / result — minimum", 50, "min"),
         ("Momentum Score", "Momentum — minimum", 60, "min"),
         ("Value Score", "Value — minimum", 50, "min"),
@@ -1479,15 +1508,18 @@ elif page=="VPA Scanner":
     if scan.empty:
         st.info("Run a full-market or quick promising-shares scan first. VPA uses the same downloaded price history.")
     else:
-        missing_count = (int(scan["Price"].notna().sum()) if "VPA Score" not in scan.columns
-                         else int((scan["Price"].notna() & scan["VPA Score"].isna()).sum()))
+        missing_vpa = (scan["Price"].notna() if "VPA Score" not in scan.columns
+                       else (scan["Price"].notna() & pd.to_numeric(scan["VPA Score"], errors="coerce").isna()))
+        missing_20d = (scan["Price"].notna() if "20D Distribution Risk" not in scan.columns
+                       else (scan["Price"].notna() & pd.to_numeric(scan["20D Distribution Risk"], errors="coerce").isna()))
+        missing_count = int((missing_vpa | missing_20d).sum())
         if missing_count:
-            st.warning(f"{missing_count} tickers have prices but no VPA score. These may be reused Phase 3 results. You can repair VPA without rescanning fundamentals.")
-            if st.button("Calculate / repair missing VPA scores", type="primary"):
-                with st.spinner("Refreshing VPA from historical prices and volume…"):
-                    repaired = refresh_vpa_results(scan, st.session_state.get("scan_period", "1y"))
-                    st.session_state["scan_results"] = repaired
-                st.rerun()
+            st.warning(f"{missing_count} shares need updated VPA or 20-day distribution scores. Existing scan data may predate this feature.")
+        if st.button("Refresh VPA + 20-day distribution scores", type="primary"):
+            with st.spinner("Refreshing VPA from historical prices and volume…"):
+                repaired = refresh_vpa_results(scan, st.session_state.get("scan_period", "1y"))
+                st.session_state["scan_results"] = repaired
+            st.rerun()
         vpa=scan[scan["Price"].notna()].copy()
         # Backward compatibility: cached/session scan results from Phase 3 or
         # earlier Phase 5 builds may not contain the newer VPA columns.
@@ -1496,6 +1528,7 @@ elif page=="VPA Scanner":
             "VPA Score": np.nan,
             "Accumulation Score": np.nan,
             "Distribution Risk": np.nan,
+            "20D Distribution Risk": np.nan,
             "Effort Result Score": np.nan,
             "VPA Signal": "VPA data not available in this saved scan",
             "VPA Notes": "Run a fresh scan to calculate VPA from OHLCV history."
@@ -1510,9 +1543,9 @@ elif page=="VPA Scanner":
         a,b,c=st.columns(3)
         a.metric("Shares with VPA score",int(vpa["VPA Score"].notna().sum()))
         b.metric("Possible accumulation (60+)",int((vpa["Accumulation Score"]>=60).sum()))
-        c.metric("Distribution warnings",int((vpa["Distribution Risk"]>=35).sum()))
-        st.caption("VPA score combines a 20-session directional-volume/range assessment, effort-versus-result and latest-bar event flags. It is a research ranking, not a probability or buy/sell signal.")
-        cols=["Ticker","Company","Price","Early-Mover Score","VPA Score","Accumulation Score","Distribution Risk","Effort Result Score","VPA Signal","VPA Notes","Volume Change %","Return 1W %","Return 1M %","Data Date"]
+        c.metric("20-day distribution warnings",int((vpa["20D Distribution Risk"]>=35).sum()))
+        st.caption("Distribution Risk is the latest-day warning score; 20D Distribution Risk measures recency-weighted warnings over 20 sessions with a persistence penalty. VPA score combines a 20-session directional-volume/range assessment, effort-versus-result and latest-bar event flags. It is a research ranking, not a probability or buy/sell signal.")
+        cols=["Ticker","Company","Price","Early-Mover Score","VPA Score","Accumulation Score","Distribution Risk","20D Distribution Risk","Effort Result Score","VPA Signal","VPA Notes","Volume Change %","Return 1W %","Return 1M %","Data Date"]
         st.dataframe(vpa[[k for k in cols if k in vpa]].round(2),use_container_width=True,hide_index=True)
         st.download_button("Download VPA rankings CSV",vpa.to_csv(index=False).encode(),file_name="asx_vpa_rankings.csv",mime="text/csv")
         st.subheader("How to interpret the signals")
