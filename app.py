@@ -8,6 +8,7 @@ import sqlite3
 import json
 import hashlib
 import tempfile
+import os
 from pathlib import Path
 
 st.set_page_config(page_title="ASX Share Analyser", page_icon="📈", layout="wide")
@@ -532,6 +533,35 @@ def render_database_backup(key_prefix):
     if backup:
         st.download_button("Download SQLite backup",data=backup,file_name=st.session_state.get("sqlite_backup_filename","asx_prediction_history_backup.sqlite"),mime="application/vnd.sqlite3",key=f"{key_prefix}_download_db_backup")
 
+def render_database_restore():
+    """Restore a validated SQLite backup; no merge, so require explicit confirmation."""
+    with st.expander("Restore prediction database from a downloaded SQLite backup"):
+        st.warning("Restoring replaces ALL current local prediction, historical learning and batch progress data. Download a fresh backup first. On Streamlit Cloud, this restored file is still temporary unless you also keep an external copy.")
+        upload=st.file_uploader("Select a previous .sqlite backup",type=["sqlite","db"],key="restore_sqlite_upload")
+        confirmed=st.checkbox("I understand this replaces the current local database",key="restore_sqlite_confirm")
+        if st.button("Restore database",disabled=upload is None or not confirmed,key="restore_sqlite_button"):
+            try:
+                raw=upload.getvalue()
+                if len(raw)>350_000_000 or not raw.startswith(b"SQLite format 3\x00"):
+                    raise ValueError("Not a supported SQLite database backup (or file exceeds 350 MB).")
+                with tempfile.TemporaryDirectory(dir=str(DB_PATH.parent)) as folder:
+                    candidate=Path(folder)/"candidate.sqlite"
+                    candidate.write_bytes(raw)
+                    with sqlite3.connect(f"file:{candidate}?mode=ro",uri=True) as check:
+                        if check.execute("PRAGMA quick_check").fetchone()[0]!="ok":
+                            raise ValueError("SQLite integrity check failed.")
+                        tables={r[0] for r in check.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                        if not {"predictions","historical_learning"}.issubset(tables):
+                            raise ValueError("The backup does not contain the required prediction tables.")
+                    # A clean SQLite backup has no live WAL; remove stale WAL files after replacement.
+                    os.replace(candidate,DB_PATH)
+                    for suffix in ("-wal","-shm"):
+                        Path(str(DB_PATH)+suffix).unlink(missing_ok=True)
+                st.success("Backup restored. Refresh the app to load the restored records.")
+            except Exception as exc:
+                st.error(f"Restore failed; no database changes were intended: {exc}")
+
+
 def component_scores(row):
     def val(k):
         x=num(row.get(k)); return x if x is not None and np.isfinite(x) else None
@@ -982,6 +1012,76 @@ def sector_return(series, sessions):
     first, last = float(series.iloc[-sessions-1]), float(series.iloc[-1])
     return (last / first - 1) * 100 if first > 0 else None
 
+def basket_sector_for_ticker(ticker):
+    matches=[name for name,codes in SECTOR_BASKETS.items() if ticker in codes]
+    return " / ".join(matches) if matches else "Not in representative baskets"
+
+
+def sector_accuracy_page():
+    st.header("Sector-aware prediction accuracy")
+    st.write("Compare saved Early-Mover predictions with the ASX 200 and inspect whether a sector basket was leading or lagging **at the signal date**. This uses only the representative basket constituents, not the full ASX sector universe.")
+    horizon=st.selectbox("Outcome horizon (trading sessions)",[5,10,20,30,60],index=2,key="sector_accuracy_horizon")
+    con=db_connect()
+    records=pd.read_sql_query(f"SELECT ticker,signal_date,base_score,return_{horizon}d AS actual_return,features_json FROM predictions WHERE return_{horizon}d IS NOT NULL",con)
+    con.close()
+    if records.empty:
+        st.info("No completed predictions at this horizon yet. Save predictions in Early-Mover Tracker, then refresh outcomes in Prediction Lab after enough trading sessions.")
+        return
+    records["Sector basket"]=records["ticker"].map(basket_sector_for_ticker)
+    st.caption(f"{len(records)} completed predictions available. Sector membership covers only the selected representative shares; other ASX tickers remain unclassified.")
+    if not st.button("Calculate benchmark and historical sector context",key="sector_accuracy_run"):
+        st.dataframe(records[["ticker","signal_date","Sector basket","base_score","actual_return"]].rename(columns={"ticker":"Ticker","signal_date":"Signal date","base_score":"Saved score","actual_return":"Forward return %"}),hide_index=True,use_container_width=True)
+        return
+    needed={t for code in records.ticker for t in SECTOR_BASKETS.get(basket_sector_for_ticker(code),[]) }  # exclude ambiguous baskets
+    symbols=["^AXJO"]+[f"{t}.AX" for t in sorted(needed)]
+    with st.spinner("Loading historical benchmark and basket prices..."):
+        histories=sector_price_history(tuple(symbols))
+    benchmark=histories.get("^AXJO")
+    if benchmark is None:
+        st.error("ASX 200 history unavailable; cannot calculate relative outcomes.")
+        return
+    def historical_return_at(series,signal_date,back=63,forward=None):
+        if series is None: return np.nan
+        idx=pd.to_datetime(series.index).tz_localize(None) if getattr(series.index,"tz",None) is not None else pd.to_datetime(series.index)
+        position=idx.searchsorted(pd.Timestamp(signal_date),side="right")-1
+        if position<0: return np.nan
+        if forward is not None:
+            target=position+forward
+            if target>=len(series): return np.nan
+            return (float(series.iloc[target])/float(series.iloc[position])-1)*100
+        if position<back: return np.nan
+        return (float(series.iloc[position])/float(series.iloc[position-back])-1)*100
+    results=[]
+    for _,r in records.iterrows():
+        sector=basket_sector_for_ticker(r.ticker)
+        asx_future=historical_return_at(benchmark,r.signal_date,forward=horizon)
+        asx_prior=historical_return_at(benchmark,r.signal_date)
+        member_returns=[]
+        if sector in SECTOR_BASKETS:
+            for ticker in SECTOR_BASKETS[sector]:
+                value=historical_return_at(histories.get(f"{ticker}.AX"),r.signal_date)
+                if np.isfinite(value): member_returns.append(value)
+        sector_prior=float(np.mean(member_returns)) if len(member_returns)>=3 else np.nan
+        relative_sector=sector_prior-asx_prior if np.isfinite(sector_prior) and np.isfinite(asx_prior) else np.nan
+        results.append({"Ticker":r.ticker,"Signal date":r.signal_date,"Sector basket":sector,"Sector status at signal":"Leading" if np.isfinite(relative_sector) and relative_sector>0 else ("Lagging" if np.isfinite(relative_sector) else "Unknown"),"Prior sector vs ASX (pp)":relative_sector,"Saved score":r.base_score,"Forward return %":r.actual_return,"ASX forward return %":asx_future,"Excess return (pp)":r.actual_return-asx_future if np.isfinite(asx_future) else np.nan})
+    result=pd.DataFrame(results)
+    usable=result.dropna(subset=["Excess return (pp)"])
+    if usable.empty:
+        st.warning("No benchmark-matched outcomes. Historical price coverage is limited to two years.")
+    else:
+        a,b,c=st.columns(3)
+        a.metric("Benchmark-matched signals",len(usable))
+        b.metric("Outperformed ASX 200",f"{(usable['Excess return (pp)']>0).mean()*100:.1f}%")
+        c.metric("Average excess return",f"{usable['Excess return (pp)'].mean():+.2f} pp")
+        summary=usable.groupby("Sector status at signal",dropna=False).agg(Signals=("Ticker","size"),Positive_rate=("Forward return %",lambda v:round((v>0).mean()*100,1)),Average_return=("Forward return %","mean"),Average_excess=("Excess return (pp)","mean")).reset_index()
+        st.subheader("Does prior sector strength matter?")
+        st.dataframe(summary.round(2),hide_index=True,use_container_width=True)
+        st.caption("Positive rate measures gains above zero; excess return compares against the ASX 200. 'Unknown' includes tickers outside our small baskets and dates without enough price history.")
+    st.dataframe(result.round(2),hide_index=True,use_container_width=True)
+    st.download_button("Download sector accuracy CSV",result.to_csv(index=False).encode(),file_name="asx_sector_prediction_accuracy.csv",mime="text/csv")
+    st.caption("Important: this is descriptive, not causal. The fixed baskets have survivorship bias, and prices may be missing. The benchmark uses a price index while share returns are adjusted for corporate actions/dividends, so comparisons are not perfectly like-for-like. Sector status uses the prior 63 trading sessions and is not used to modify scores. Historical data limited to 2 years; outcomes must already be completed in Prediction Lab.")
+
+
 def sector_performance_page():
     st.header("Sector Performance")
     st.write("Compare representative ASX sector baskets with the S&P/ASX 200 price index (^AXJO). Identify strong and weak sectors before reviewing individual shares.")
@@ -1031,7 +1131,7 @@ def sector_performance_page():
 
 MASTER_TICKERS = load_master_tickers()
 with st.sidebar:
-    page=st.radio("Page",["Single-Share Analysis","Automatic Share Scanner","Early-Mover Tracker","VPA Scanner","Prediction Lab","Phase 4 Backtest","Sector Performance","Lower-Risk Investing","Value Investing","Momentum Trading","High-Growth Shares","Long-Term Investing","Portfolio Planner"])
+    page=st.radio("Page",["Single-Share Analysis","Automatic Share Scanner","Early-Mover Tracker","VPA Scanner","Prediction Lab","Phase 4 Backtest","Sector Performance","Sector Prediction Accuracy","Lower-Risk Investing","Value Investing","Momentum Trading","High-Growth Shares","Long-Term Investing","Portfolio Planner"])
     st.divider()
     ticker_text=st.text_area("ASX tickers (commas or new lines)",", ".join(MASTER_TICKERS),height=160,
         help="Defaults to the bundled ASX company list. Edit or paste your own tickers if needed.")
@@ -1290,10 +1390,11 @@ elif page=="Early-Mover Tracker":
         else:
             st.info(f"Learning engine warming up: {learned_n}/30 completed 20-day outcomes. Original transparent weights remain in use until there is a minimum sample.")
         movers=movers[movers["Price"].notna()].sort_values("Early-Mover Score",ascending=False,na_position="last")
+        movers["Sector basket"]=movers["Ticker"].map(basket_sector_for_ticker)
         movers["Signal Tier"]=np.select([movers["Early-Mover Score"]>=80,movers["Early-Mover Score"]>=65],["Priority review","Watch closely"],default="Lower priority")
         st.caption("The score combines momentum, trend, volume, short-term extension, VPA, accumulation, distribution safety, effort/result, daily range, close position, opening gap and volatility. Prediction Lab shows the normalized base and learned weights. Missing inputs are excluded and available weights are renormalised.")
         st.caption(f"Latest scan: {st.session_state.get('scan_time','unknown')}. Use each share's Data Date to check freshness.")
-        cols=["Ticker","Company","Price","Early-Mover Score","Signal Tier","Return 1W %","Return 1M %","Return 3M %","Price vs 50D %","Above 200D %","Volume Change %","Distance from 20D High %","VPA Score","Accumulation Score","Distribution Risk","VPA Signal","Market Cap","Data Date","Scan Status"]
+        cols=["Ticker","Company","Price","Early-Mover Score","Signal Tier","Sector basket","Return 1W %","Return 1M %","Return 3M %","Price vs 50D %","Above 200D %","Volume Change %","Distance from 20D High %","VPA Score","Accumulation Score","Distribution Risk","VPA Signal","Market Cap","Data Date","Scan Status"]
         st.dataframe(movers[[c for c in cols if c in movers.columns]].round(2),use_container_width=True,hide_index=True)
         st.download_button("Download early-mover rankings CSV",movers.to_csv(index=False).encode(),file_name="asx_early_mover_rankings.csv",mime="text/csv")
         prediction_selection=st.multiselect("Record these as formal predictions",movers["Ticker"].tolist(),key="prediction_select")
@@ -1389,6 +1490,7 @@ elif page=="Prediction Lab":
         st.success(f"Updated outcomes for {count} prediction(s).")
     render_learning_dashboard()
     render_database_backup("prediction_lab")
+    render_database_restore()
     con=db_connect(); predictions=pd.read_sql_query("SELECT * FROM predictions ORDER BY signal_date DESC,id DESC",con); con.close()
     if predictions.empty:
         st.info("No predictions recorded yet. Go to Early-Mover Tracker, select shares and choose 'Save selected predictions to history'.")
@@ -1581,9 +1683,12 @@ elif page=="Phase 4 Backtest":
         with st.expander(f"Unavailable shares ({len(failures)})"):
             st.dataframe(pd.DataFrame(failures),use_container_width=True,hide_index=True)
     render_database_backup("phase4_backtest")
+    render_database_restore()
 
 elif page=="Sector Performance":
     sector_performance_page()
+elif page=="Sector Prediction Accuracy":
+    sector_accuracy_page()
 
 elif page=="Lower-Risk Investing":
     st.header(page); show_scan("Lower-Risk Score","A relative screen for shares above their 200-day average and without a severe monthly decline. These are not guaranteed to be safe.")
