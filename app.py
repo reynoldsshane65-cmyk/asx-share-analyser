@@ -1130,6 +1130,42 @@ def sector_performance_page():
 
 
 MASTER_TICKERS = load_master_tickers()
+def apply_custom_score_filters(frame, key_prefix):
+    """Optional AND-combined filters; missing scores never pass an enabled filter."""
+    specs = [
+        ("Early-Mover Score", "EMS — minimum", 70, "min"),
+        ("VPA Score", "VPA — minimum", 65, "min"),
+        ("Accumulation Score", "Accumulation — minimum", 60, "min"),
+        ("Distribution Risk", "Distribution risk — maximum", 35, "max"),
+        ("Effort Result Score", "Effort / result — minimum", 50, "min"),
+        ("Momentum Score", "Momentum — minimum", 60, "min"),
+        ("Value Score", "Value — minimum", 50, "min"),
+        ("Growth Score", "Growth — minimum", 50, "min"),
+        ("Overall Score", "Overall — minimum", 60, "min"),
+    ]
+    with st.expander("🎚️ Custom score filters — show only shares meeting ALL enabled rules", expanded=True):
+        st.caption("Tick the scores you want to filter, then move each slider. Unticked scores are ignored. All enabled rules must pass. Missing values do not pass an enabled filter.")
+        a,b=st.columns(2)
+        active=[]
+        for i,(column,label,default,mode) in enumerate(specs):
+            with (a if i%2==0 else b):
+                enabled=st.checkbox(f"Use {label.split(' — ')[0]}",value=False,key=f"{key_prefix}_use_{i}")
+                threshold=st.slider(label,0,100,default,1,key=f"{key_prefix}_threshold_{i}",disabled=not enabled)
+                if enabled:
+                    active.append((column,threshold,mode))
+        if st.button("Clear all filters",key=f"{key_prefix}_clear"):
+            for i in range(len(specs)):
+                st.session_state[f"{key_prefix}_use_{i}"]=False
+            st.rerun()
+    filtered=frame.copy()
+    for column,threshold,mode in active:
+        values=pd.to_numeric(filtered[column],errors="coerce") if column in filtered else pd.Series(np.nan,index=filtered.index)
+        filtered=filtered[values.ge(threshold) if mode=="min" else values.le(threshold)]
+    st.caption(f"Showing **{len(filtered):,} of {len(frame):,}** shares with price data. {len(active)} active score filter(s).")
+    if filtered.empty:
+        st.warning("No shares match every enabled filter. Reduce minimums, increase maximum distribution risk, or untick some rules.")
+    return filtered
+
 with st.sidebar:
     page=st.radio("Page",["Single-Share Analysis","Automatic Share Scanner","Early-Mover Tracker","VPA Scanner","Prediction Lab","Phase 4 Backtest","Sector Performance","Sector Prediction Accuracy","Lower-Risk Investing","Value Investing","Momentum Trading","High-Growth Shares","Long-Term Investing","Portfolio Planner"])
     st.divider()
@@ -1394,6 +1430,7 @@ elif page=="Early-Mover Tracker":
         movers["Signal Tier"]=np.select([movers["Early-Mover Score"]>=80,movers["Early-Mover Score"]>=65],["Priority review","Watch closely"],default="Lower priority")
         st.caption("The score combines momentum, trend, volume, short-term extension, VPA, accumulation, distribution safety, effort/result, daily range, close position, opening gap and volatility. Prediction Lab shows the normalized base and learned weights. Missing inputs are excluded and available weights are renormalised.")
         st.caption(f"Latest scan: {st.session_state.get('scan_time','unknown')}. Use each share's Data Date to check freshness.")
+        movers=apply_custom_score_filters(movers,"em_filter")
         cols=["Ticker","Company","Price","Early-Mover Score","Signal Tier","Sector basket","Return 1W %","Return 1M %","Return 3M %","Price vs 50D %","Above 200D %","Volume Change %","Distance from 20D High %","VPA Score","Accumulation Score","Distribution Risk","VPA Signal","Market Cap","Data Date","Scan Status"]
         st.dataframe(movers[[c for c in cols if c in movers.columns]].round(2),use_container_width=True,hide_index=True)
         st.download_button("Download early-mover rankings CSV",movers.to_csv(index=False).encode(),file_name="asx_early_mover_rankings.csv",mime="text/csv")
@@ -1466,13 +1503,16 @@ elif page=="VPA Scanner":
         for column, default_value in vpa_defaults.items():
             if column not in vpa.columns:
                 vpa[column] = default_value
+        learn_w,_,_,_=learned_weights()
+        vpa["Early-Mover Score"]=vpa.apply(lambda row: score_with_weights(row,learn_w),axis=1)
         vpa=vpa.sort_values(["VPA Score","Accumulation Score"],ascending=False,na_position="last")
+        vpa=apply_custom_score_filters(vpa,"vpa_filter")
         a,b,c=st.columns(3)
         a.metric("Shares with VPA score",int(vpa["VPA Score"].notna().sum()))
         b.metric("Possible accumulation (60+)",int((vpa["Accumulation Score"]>=60).sum()))
         c.metric("Distribution warnings",int((vpa["Distribution Risk"]>=35).sum()))
         st.caption("VPA score combines a 20-session directional-volume/range assessment, effort-versus-result and latest-bar event flags. It is a research ranking, not a probability or buy/sell signal.")
-        cols=["Ticker","Company","Price","VPA Score","Accumulation Score","Distribution Risk","Effort Result Score","VPA Signal","VPA Notes","Volume Change %","Return 1W %","Return 1M %","Data Date"]
+        cols=["Ticker","Company","Price","Early-Mover Score","VPA Score","Accumulation Score","Distribution Risk","Effort Result Score","VPA Signal","VPA Notes","Volume Change %","Return 1W %","Return 1M %","Data Date"]
         st.dataframe(vpa[[k for k in cols if k in vpa]].round(2),use_container_width=True,hide_index=True)
         st.download_button("Download VPA rankings CSV",vpa.to_csv(index=False).encode(),file_name="asx_vpa_rankings.csv",mime="text/csv")
         st.subheader("How to interpret the signals")
