@@ -1293,9 +1293,29 @@ def render_opportunities(scan):
     result=pd.DataFrame(candidates)
     # Avoid claiming one ticker is stronger simply because it matches more rules.
     result["_pass"]=(result["Evidence"]=="Passed initial holdout").astype(int)
-    result=result.sort_values(["_pass","Historical positive %","Ticker"],ascending=[False,False,True],na_position="last")
+    # Rank on current, share-specific evidence rather than alphabetic ticker order.
+    # Previously most setups shared the same validation status and historical
+    # win rate, so sorting by Ticker made the shortlist almost entirely A/B shares.
+    lookup=data.drop_duplicates("Ticker").set_index("Ticker")
+    def numeric_metric(column, default=50):
+        values=pd.to_numeric(lookup.get(column, pd.Series(index=lookup.index, dtype=float)), errors="coerce")
+        return values.reindex(result["Ticker"]).reset_index(drop=True).fillna(default)
+    result=result.reset_index(drop=True)
+    ems=numeric_metric("Early-Mover Score", np.nan)
+    vpa=numeric_metric("VPA Score", 50)
+    accumulation=numeric_metric("Accumulation Score", 50)
+    risk=numeric_metric("Distribution Risk", 50)
+    momentum=numeric_metric("Momentum Score", 50)
+    ems=ems.fillna(momentum)
+    # A transparent prioritisation heuristic, NOT a calibrated success probability.
+    result["Priority score"]=(.35*ems.clip(0,100)+.30*vpa.clip(0,100)+
+        .20*accumulation.clip(0,100)+.15*(100-risk.clip(0,100))).round(1)
+    result=result.sort_values(["_pass","Priority score","Ticker"],ascending=[False,False,True],na_position="last")
     top=result.drop_duplicates("Ticker").head(20).drop(columns="_pass")
     st.metric("Candidates matching a setup",result["Ticker"].nunique())
+    st.caption("Ranking: 35% EMS (or momentum if unavailable), 30% VPA, 20% accumulation, 15% distribution safety. These weights are heuristic, not validated probabilities. Tickers are only used to break exact ties.")
+    letters=sorted(set(data["Ticker"].astype(str).str[0].str.upper()))
+    st.caption(f"Scanned shares with usable prices span {len(letters)} starting letters: {', '.join(letters)}. Shortlist spans {top['Ticker'].astype(str).str[0].nunique()} starting letters.")
     if not (top["Evidence"]=="Passed initial holdout").any():
         st.warning("None of the available setups has passed the basic historical holdout check. These are watchlist candidates, not evidence-backed buy signals.")
     st.dataframe(top,use_container_width=True,hide_index=True)
