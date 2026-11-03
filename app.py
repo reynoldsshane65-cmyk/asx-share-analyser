@@ -1255,6 +1255,11 @@ def render_opportunities(scan):
     if scan is None or scan.empty:
         st.info("Run / refresh multi-share scan in the sidebar first. Then return here to view the shortlist.")
         return
+    report=st.session_state.get("scan_report",{})
+    if report:
+        st.caption(f"Universe coverage: {report.get('requested',len(scan)):,} requested; {report.get('usable',0):,} usable results. The shortlist ranks matching shares across ALL scanned results, not just the first 20 tickers.")
+        if report.get("requested",0)<len(MASTER_TICKERS):
+            st.warning("This scan did not cover the entire bundled ASX list. Select Full-market scan in the sidebar and run the scan to search all tickers.")
     data=scan[scan["Price"].notna()].copy()
     if data.empty:
         st.warning("No usable price data in the latest scan.")
@@ -1304,8 +1309,12 @@ with st.sidebar:
         help="Defaults to the bundled ASX company list. Edit or paste your own tickers if needed.")
     tickers=list(dict.fromkeys(x.strip().upper().replace(".AX","") for x in ticker_text.replace("\n",",").split(",") if x.strip()))
     scan_mode=st.selectbox("Scan mode",["Full-market scan","Quick promising-shares scan"])
-    max_tickers=st.slider("Maximum tickers per scan",5,2000,min(2000,max(5,len(tickers))),5)
-    tickers=tickers[:max_tickers]
+    # Full-market mode must cover the whole supplied universe, not just its alphabetic prefix.
+    universe_count=len(tickers)
+    if scan_mode == "Full-market scan":
+        st.caption(f"Full-market coverage: all {universe_count:,} tickers in the supplied list (subject to data availability).")
+    else:
+        st.caption(f"Quick mode samples across the entire {universe_count:,}-ticker list; use Full-market for comprehensive coverage.")
     if scan_mode == "Quick promising-shares scan":
         prior=st.session_state.get("scan_results",pd.DataFrame())
         if isinstance(prior,pd.DataFrame) and not prior.empty and "Overall Score" in prior.columns:
@@ -1313,7 +1322,11 @@ with st.sidebar:
             if promising:
                 tickers=promising
         else:
-            tickers=[t for t in STARTER_TICKERS if t in tickers][:150] or tickers[:150]
+            # Sample evenly across the entire list rather than always choosing A/B tickers.
+            if len(tickers)>150:
+                positions=np.linspace(0,len(tickers)-1,150,dtype=int)
+                tickers=[tickers[i] for i in positions]
+            # Otherwise use every supplied ticker.
     scan_label=st.selectbox("Scanner price history",["1 year","2 years","5 years"])
     scan_period={"1 year":"1y","2 years":"2y","5 years":"5y"}[scan_label]
     if st.button("Clear cached data"):
