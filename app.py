@@ -1195,8 +1195,110 @@ def apply_custom_score_filters(frame, key_prefix):
         st.warning("No shares match every enabled filter. Reduce minimums, increase maximum distribution risk, or untick some rules.")
     return filtered
 
+# ---------------- Simple evidence-first opportunity shortlist ----------------
+def opportunity_conditions(frame):
+    """A deliberately small, fixed set of explainable 20-session setups."""
+    f=frame
+    def n(k):
+        return pd.to_numeric(f[k],errors="coerce") if k in f else pd.Series(np.nan,index=f.index)
+    trend=(n("Return 1M %")>0)&(n("Price vs 50D %")>0)&(n("Volume Change %")>0)
+    breakout=(n("Return 1W %")>0)&(n("Distance from 20D High %")>=-3)&(n("Volume Change %")>20)
+    recovery=(n("Return 1M %")<0)&(n("VPA Score")>=65)&(n("Distribution Risk")<=20)&(n("Return 1W %")>-20)
+    return {"Trend + volume":trend,"Near-high breakout":breakout,"Possible recovery":recovery}
+
+def opportunity_evidence():
+    """Fit the strategy on earlier outcomes; audit it on a later untouched period."""
+    con=db_connect()
+    try:
+        raw=pd.read_sql_query("SELECT signal_date,features_json,return_20d FROM historical_learning_monthly WHERE return_20d IS NOT NULL",con)
+    finally:
+        con.close()
+    if raw.empty or len(raw)<120:
+        return {},"At least 120 completed historical monthly examples are needed. Build them on the Phase 4 Backtest page."
+    rows=[]
+    for r in raw.itertuples(index=False):
+        try: features=json.loads(r.features_json or '{}')
+        except (ValueError,TypeError): continue
+        rows.append({**features,"Signal date":r.signal_date,"Return 20d %":r.return_20d})
+    hist=pd.DataFrame(rows)
+    hist["Signal date"]=pd.to_datetime(hist["Signal date"],errors="coerce")
+    hist["Return 20d %"]=pd.to_numeric(hist["Return 20d %"],errors="coerce")
+    hist=hist.dropna(subset=["Signal date","Return 20d %"]).sort_values("Signal date")
+    if len(hist)<120:return {},"Not enough valid completed historical examples."
+    split=hist["Signal date"].iloc[int(len(hist)*.7)]
+    train=hist[hist["Signal date"]<split-pd.Timedelta(days=45)].copy()
+    test=hist[hist["Signal date"]>=split].copy()
+    if len(train)<60 or len(test)<30:return {},"Not enough separate earlier and later observations for validation."
+    train_conditions=opportunity_conditions(train)
+    test_conditions=opportunity_conditions(test)
+    baseline=float((test["Return 20d %"]>0).mean()*100)
+    results={}
+    for name,train_mask in train_conditions.items():
+        t=train.loc[train_mask,"Return 20d %"]
+        v=test.loc[test_conditions[name],"Return 20d %"]
+        results[name]={"train_n":len(t),"test_n":len(v),"win_rate":float((v>0).mean()*100) if len(v) else None,
+                       "avg_return":float(v.mean()) if len(v) else None,"baseline":baseline,
+                       "validated":bool(len(t)>=25 and len(v)>=15 and (v>0).mean()*100>baseline and v.mean()>0)}
+    return results,None
+
+def opportunity_reason(row,name):
+    reasons={
+        "Trend + volume":"Positive monthly trend, above 50-day average, with increasing volume",
+        "Near-high breakout":"Positive weekly momentum, near its 20-day high, with increasing volume",
+        "Possible recovery":"Weak monthly price trend but stronger VPA and limited recent distribution warnings"}
+    return reasons[name]
+
+def render_opportunities(scan):
+    st.header("Today's Opportunities")
+    st.write("A simple 2–4 week research shortlist. Candidates must match a transparent price/volume setup; historical results determine whether the setup has demonstrated value.")
+    st.caption("Uses the latest completed scan, not a live price feed. No ranking here is a probability of profit or a personalised buy recommendation.")
+    if scan is None or scan.empty:
+        st.info("Run / refresh multi-share scan in the sidebar first. Then return here to view the shortlist.")
+        return
+    data=scan[scan["Price"].notna()].copy()
+    if data.empty:
+        st.warning("No usable price data in the latest scan.")
+        return
+    evidence,error=opportunity_evidence()
+    if error: st.warning("Historical validation unavailable: "+error+" The app will show research candidates, not verified opportunities.")
+    else:
+        with st.expander("See historical evidence (later holdout period)"):
+            table=[{"Setup":k,"Earlier examples":v["train_n"],"Later examples":v["test_n"],
+                    "Later positive %":round(v["win_rate"],1) if v["win_rate"] is not None else None,
+                    "Later average return %":round(v["avg_return"],2) if v["avg_return"] is not None else None,
+                    "Later all-share positive %":round(v["baseline"],1),
+                    "Passed basic check":v["validated"]} for k,v in evidence.items()]
+            st.dataframe(pd.DataFrame(table),hide_index=True,use_container_width=True)
+            st.caption("Historical tests use monthly examples with a 45-calendar-day training gap. This is an exploratory holdout check, not a trading simulation: it excludes costs, delistings may be missing, and the historical ticker universe may suffer survivorship bias. Do not interpret win rates as calibrated forecasts.")
+    candidates=[]
+    masks=opportunity_conditions(data)
+    for name,mask in masks.items():
+        for _,r in data.loc[mask].iterrows():
+            e=evidence.get(name,{})
+            candidates.append({"Ticker":r.get("Ticker"),"Company":r.get("Company"),"Price":r.get("Price"),
+                "Setup":name,"Why it appeared":opportunity_reason(r,name),
+                "Historical positive %":round(e["win_rate"],1) if e.get("win_rate") is not None else np.nan,
+                "Historical average return %":round(e["avg_return"],2) if e.get("avg_return") is not None else np.nan,
+                "Evidence":"Passed initial holdout" if e.get("validated") else "Not validated",
+                "Risk to check":"Thin trading / sharp reversal / company announcements",
+                "Data Date":r.get("Data Date","")})
+    if not candidates:
+        st.info("No shares match the three setups in this scan. That is a valid outcome; there is no need to force a buy list.")
+        return
+    result=pd.DataFrame(candidates)
+    # Avoid claiming one ticker is stronger simply because it matches more rules.
+    result["_pass"]=(result["Evidence"]=="Passed initial holdout").astype(int)
+    result=result.sort_values(["_pass","Historical positive %","Ticker"],ascending=[False,False,True],na_position="last")
+    top=result.drop_duplicates("Ticker").head(20).drop(columns="_pass")
+    st.metric("Candidates matching a setup",result["Ticker"].nunique())
+    if not (top["Evidence"]=="Passed initial holdout").any():
+        st.warning("None of the available setups has passed the basic historical holdout check. These are watchlist candidates, not evidence-backed buy signals.")
+    st.dataframe(top,use_container_width=True,hide_index=True)
+    st.download_button("Download shortlist CSV",top.to_csv(index=False).encode(),file_name="asx_opportunity_shortlist.csv",mime="text/csv",key="opportunities_download")
+    st.caption("Historical figures reflect setup-level outcomes, not ticker-specific forecasts. Check ASX announcements, spreads, liquidity and potential losses before making any decision.")
+
 with st.sidebar:
-    page=st.radio("Page",["Single-Share Analysis","Automatic Share Scanner","Early-Mover Tracker","VPA Scanner","Prediction Lab","Phase 4 Backtest","Historical Signal Explorer","Sector Performance","Sector Prediction Accuracy","Lower-Risk Investing","Value Investing","Momentum Trading","High-Growth Shares","Long-Term Investing","Portfolio Planner"])
+    page=st.radio("Page",["Today’s Opportunities","Single-Share Analysis","Automatic Share Scanner","Early-Mover Tracker","VPA Scanner","Prediction Lab","Phase 4 Backtest","Historical Signal Explorer","Sector Performance","Sector Prediction Accuracy","Lower-Risk Investing","Value Investing","Momentum Trading","High-Growth Shares","Long-Term Investing","Portfolio Planner"])
     st.divider()
     ticker_text=st.text_area("ASX tickers (commas or new lines)",", ".join(MASTER_TICKERS),height=160,
         help="Defaults to the bundled ASX company list. Edit or paste your own tickers if needed.")
@@ -1338,7 +1440,9 @@ def show_scan(score_col,description):
         hist=load_prices(chosen+".AX",scan_period)
         if not hist.empty: st.line_chart(hist["Close"],height=230)
 
-if page=="Single-Share Analysis":
+if page=="Today’s Opportunities":
+    render_opportunities(scan)
+elif page=="Single-Share Analysis":
     st.header("Single-Share Analysis")
     with st.sidebar:
         raw=st.text_input("ASX ticker to analyse","BHP",key="single")
