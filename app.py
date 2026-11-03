@@ -1196,7 +1196,7 @@ def apply_custom_score_filters(frame, key_prefix):
     return filtered
 
 with st.sidebar:
-    page=st.radio("Page",["Single-Share Analysis","Automatic Share Scanner","Early-Mover Tracker","VPA Scanner","Prediction Lab","Phase 4 Backtest","Sector Performance","Sector Prediction Accuracy","Lower-Risk Investing","Value Investing","Momentum Trading","High-Growth Shares","Long-Term Investing","Portfolio Planner"])
+    page=st.radio("Page",["Single-Share Analysis","Automatic Share Scanner","Early-Mover Tracker","VPA Scanner","Prediction Lab","Phase 4 Backtest","Historical Signal Explorer","Sector Performance","Sector Prediction Accuracy","Lower-Risk Investing","Value Investing","Momentum Trading","High-Growth Shares","Long-Term Investing","Portfolio Planner"])
     st.divider()
     ticker_text=st.text_area("ASX tickers (commas or new lines)",", ".join(MASTER_TICKERS),height=160,
         help="Defaults to the bundled ASX company list. Edit or paste your own tickers if needed.")
@@ -1632,6 +1632,69 @@ elif page=="Prediction Lab":
                 con=db_connect(); con.execute("DELETE FROM predictions"); con.commit(); con.close()
                 st.session_state["confirm_delete_predictions"]=False; st.rerun()
     st.caption(f"Local database: {DB_PATH.name}. Streamlit Community Cloud local storage may be reset by app rebuilds or restarts. Download the CSV backup regularly; a later upgrade can connect durable cloud storage.")
+
+elif page=="Historical Signal Explorer":
+    st.header("🔎 Historical Signal Explorer")
+    st.write("Reconstruct technical signals using only daily bars available at each selected historical close, then inspect subsequent returns.")
+    st.caption("Uses the app's existing fixed-weight early-mover model, VPA and accumulation calculations. It does not replay past news or point-in-time fundamentals. Adjusted historical prices may be revised after corporate actions.")
+    symbol=st.text_input("ASX ticker",value="LNQ",key="explorer_symbol").strip().upper().replace(".AX","")
+    dates_text=st.text_input("Historical dates (comma-separated)",value="2026-10-09, 2026-10-14, 2026-10-16, 2026-10-19",key="explorer_dates")
+    if st.button("Analyse historical signals",type="primary",key="explorer_run"):
+        import re
+        if not re.fullmatch(r"[A-Z0-9]{1,6}",symbol):
+            st.error("Enter a valid ASX ticker, such as LNQ.")
+        else:
+            try:
+                requested=[pd.Timestamp(part.strip()).normalize() for part in dates_text.split(",") if part.strip()]
+                if not requested:
+                    raise ValueError("Enter at least one date.")
+                if len(requested)>30:
+                    raise ValueError("Select no more than 30 dates at once.")
+                h=yf.Ticker(symbol+".AX").history(period="max",auto_adjust=True)
+                if h is None or h.empty or not all(c in h for c in ("Open","High","Low","Close","Volume")):
+                    raise ValueError("No complete OHLCV price history returned by Yahoo Finance.")
+                h=h.dropna(subset=["Close"]).sort_index().copy()
+                h.index=pd.to_datetime(h.index).tz_localize(None).normalize()
+                h=h[~h.index.duplicated(keep="last")]
+                close=h["Close"].astype(float)
+                rows=[]
+                for requested_date in requested:
+                    indices=np.flatnonzero(h.index<=requested_date)
+                    if not len(indices):
+                        rows.append({"Requested date":requested_date.date().isoformat(),"Status":"No earlier price history"})
+                        continue
+                    i=int(indices[-1])
+                    if i<200:
+                        rows.append({"Requested date":requested_date.date().isoformat(),"Signal date":h.index[i].date().isoformat(),"Status":"Needs 201 historical trading sessions"})
+                        continue
+                    past=h.iloc[:i+1]
+                    pc=past["Close"].astype(float); pv=past["Volume"].fillna(0).astype(float)
+                    price=float(pc.iloc[-1]); ma50=float(pc.tail(50).mean()); ma200=float(pc.tail(200).mean())
+                    v20=float(pv.tail(20).mean()); vprev=float(pv.iloc[-40:-20].mean())
+                    day=past.iloc[-1]; high=num(day["High"]); low=num(day["Low"]); opn=num(day["Open"])
+                    inputs={"Return 1W %":pct(pc,5),"Return 1M %":pct(pc,21),"Return 3M %":pct(pc,63),
+                        "Price vs 50D %":(price/ma50-1)*100 if ma50 else np.nan,
+                        "Above 200D %":(price/ma200-1)*100 if ma200 else np.nan,
+                        "Volume Change %":(v20/vprev-1)*100 if vprev else np.nan,
+                        "Distance from 20D High %":(price/float(pc.tail(20).max())-1)*100,
+                        "Daily range %":(high-low)/price*100 if high is not None and low is not None and price else np.nan,
+                        "Close in daily range %":(price-low)/(high-low)*100 if high is not None and low is not None and high>low else np.nan,
+                        "Gap %":(opn/float(pc.iloc[-2])-1)*100 if opn is not None and pc.iloc[-2] else np.nan,
+                        "20D volatility %":pc.pct_change().tail(20).std()*100}
+                    inputs.update(calculate_vpa(past.tail(120)))
+                    inputs["Distribution Safety"]=100-inputs["Distribution Risk"] if pd.notna(inputs["Distribution Risk"]) else np.nan
+                    result={"Requested date":requested_date.date().isoformat(),"Signal date":h.index[i].date().isoformat(),
+                        "Status":"Exact trading date" if h.index[i]==requested_date else "Previous trading session",
+                        "Closing price":price,"Early-Mover Score":score_with_weights(inputs,BASE_WEIGHTS),**inputs}
+                    for horizon in (1,5,10,20,30):
+                        result[f"Return {horizon}d %"]=(float(close.iloc[i+horizon])/price-1)*100 if i+horizon<len(close) else np.nan
+                    rows.append(result)
+                output=pd.DataFrame(rows)
+                st.dataframe(output,use_container_width=True,hide_index=True)
+                st.download_button("Download historical signal results (CSV)",output.to_csv(index=False).encode("utf-8"),file_name=f"{symbol}_historical_signals.csv",mime="text/csv")
+                st.caption("Signals use the close of the signal date; future returns start after that close. Missing future returns mean the horizon has not yet completed. Scores are screening heuristics, not probabilities. The displayed early-mover score uses original fixed weights, not weights learned from later observations.")
+            except Exception as exc:
+                st.error(f"Could not analyse {symbol}: {exc}")
 
 elif page=="Phase 4 Backtest":
     st.header("🧪 Phase 4 — Historical Backtest & Diagnostics")
