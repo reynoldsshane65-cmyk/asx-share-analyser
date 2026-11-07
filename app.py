@@ -8,6 +8,9 @@ import sqlite3
 import json
 import hashlib
 import tempfile
+import zipfile
+import shutil
+import gc
 import os
 from pathlib import Path
 
@@ -534,61 +537,172 @@ def db_connect():
     con.commit()
     return con
 
-def sqlite_backup_bytes():
-    """Create a consistent SQLite snapshot, including committed WAL data, for download."""
+# Backups are staged on disk to avoid holding a multi-GB database in Streamlit session state.
+BACKUP_CHUNK_BYTES = 100 * 1024 * 1024  # below Streamlit's default 200 MB upload limit
+BACKUP_STAGE = Path(tempfile.gettempdir()) / "asx_backup_staging"
+RESTORE_STAGE = Path(tempfile.gettempdir()) / "asx_restore_staging"
+
+
+def _stream_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _sqlite_validate(path):
+    with sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=60) as check:
+        if check.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+            raise ValueError("SQLite integrity check failed")
+        tables = {r[0] for r in check.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if not {"predictions", "historical_learning"}.issubset(tables):
+            raise ValueError("Required prediction tables are missing")
+
+
+def prepare_split_backup():
     if not DB_PATH.exists():
-        return None
-    with tempfile.TemporaryDirectory() as folder:
-        backup_path=Path(folder)/"asx_prediction_history.sqlite"
-        source=sqlite3.connect(str(DB_PATH),timeout=30)
-        target=sqlite3.connect(str(backup_path),timeout=30)
-        try:
-            source.backup(target)
-        finally:
-            target.close(); source.close()
-        return backup_path.read_bytes()
+        raise FileNotFoundError("No prediction database exists yet")
+    BACKUP_STAGE.mkdir(parents=True, exist_ok=True)
+    folder = BACKUP_STAGE / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    folder.mkdir()
+    snapshot = folder / "snapshot.sqlite"
+    source = sqlite3.connect(str(DB_PATH), timeout=60)
+    target = sqlite3.connect(str(snapshot), timeout=60)
+    try:
+        source.backup(target, pages=1000, sleep=0.1)
+    finally:
+        target.close()
+        source.close()
+    archive = folder / "database.zip"
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as z:
+        z.write(snapshot, arcname="asx_prediction_history.sqlite")
+    snapshot.unlink()
+    pieces = []
+    with open(archive, "rb") as stream:
+        n = 0
+        while True:
+            block = stream.read(BACKUP_CHUNK_BYTES)
+            if not block:
+                break
+            n += 1
+            name = f"asx_backup.part{n:03d}"
+            part = folder / name
+            part.write_bytes(block)
+            pieces.append({"name": name, "size": len(block), "sha256": hashlib.sha256(block).hexdigest()})
+    manifest = {"format": "asx-split-backup-v1", "archive_size": archive.stat().st_size,
+                "archive_sha256": _stream_sha256(archive), "parts": pieces}
+    (folder / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    archive.unlink()
+    return folder, manifest
 
 
 def render_database_backup(key_prefix):
-    st.caption("This backup contains the saved prediction database, batch progress, cached historical OHLCV prices, and learning outcomes.")
-    if st.button("Prepare SQLite database backup",key=f"{key_prefix}_prepare_db_backup"):
+    st.caption("Compressed, split backups include prediction history, cached historical prices and batch progress. Keep ALL downloaded parts and the manifest together.")
+    if st.button("Prepare compressed backup", key=f"{key_prefix}_prepare_db_backup"):
         try:
-            st.session_state["sqlite_backup_bytes"]=sqlite_backup_bytes()
-            st.session_state["sqlite_backup_filename"]=f"asx_prediction_history_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.sqlite"
+            with st.spinner("Taking a consistent SQLite snapshot and compressing it. Large databases can take several minutes…"):
+                folder, manifest = prepare_split_backup()
+            st.session_state["split_backup_folder"] = str(folder)
+            st.success(f"Prepared {len(manifest['parts'])} part(s), each at most 100 MiB.")
         except Exception as exc:
-            st.error(f"Could not prepare the database backup: {exc}")
-    backup=st.session_state.get("sqlite_backup_bytes")
-    if backup:
-        st.download_button("Download SQLite backup",data=backup,file_name=st.session_state.get("sqlite_backup_filename","asx_prediction_history_backup.sqlite"),mime="application/vnd.sqlite3",key=f"{key_prefix}_download_db_backup")
+            st.error(f"Backup preparation failed: {exc}")
+    folder_name = st.session_state.get("split_backup_folder")
+    if folder_name and Path(folder_name, "manifest.json").exists():
+        folder = Path(folder_name)
+        manifest = json.loads((folder / "manifest.json").read_text())
+        st.download_button("Download manifest.json FIRST", data=(folder / "manifest.json").read_bytes(),
+                           file_name="asx_backup_manifest.json", mime="application/json", key=f"{key_prefix}_manifest")
+        for item in manifest["parts"]:
+            part = folder / item["name"]
+            # Download buttons hold their payload in memory; only read the requested 100 MiB part.
+            with st.expander(f"Download {item['name']} ({item['size'] / 1048576:.1f} MiB)"):
+                st.download_button(f"Download {item['name']}", data=part.read_bytes(),
+                                   file_name=item["name"], mime="application/octet-stream",
+                                   key=f"{key_prefix}_{item['name']}")
+        st.info("Save every part and the manifest somewhere permanent. Streamlit Cloud storage is temporary.")
+
 
 def render_database_restore():
-    """Restore a validated SQLite backup; no merge, so require explicit confirmation."""
-    with st.expander("Restore prediction database from a downloaded SQLite backup"):
-        st.warning("Restoring replaces ALL current local prediction, historical learning and batch progress data. Download a fresh backup first. On Streamlit Cloud, this restored file is still temporary unless you also keep an external copy.")
-        upload=st.file_uploader("Select a previous .sqlite backup",type=["sqlite","db"],key="restore_sqlite_upload")
-        confirmed=st.checkbox("I understand this replaces the current local database",key="restore_sqlite_confirm")
-        if st.button("Restore database",disabled=upload is None or not confirmed,key="restore_sqlite_button"):
+    with st.expander("Restore prediction database (split backup or existing SQLite file)"):
+        st.warning("Restore REPLACES the current database. Download a backup of the current database first. Cloud disk storage is temporary; do not reboot during restoration.")
+        st.caption("For a new backup: upload its manifest once, then upload ONE part at a time in order. The app saves parts on disk between uploads. For your existing 2 GB .sqlite file, split it locally into 100 MiB parts first; see the included helper script.")
+        manifest_upload = st.file_uploader("Upload backup manifest (.json)", type=["json"], key="restore_manifest_upload")
+        if st.button("Start new restore from manifest", disabled=manifest_upload is None, key="restore_manifest_start"):
             try:
-                raw=upload.getvalue()
-                if len(raw)>350_000_000 or not raw.startswith(b"SQLite format 3\x00"):
-                    raise ValueError("Not a supported SQLite database backup (or file exceeds 350 MB).")
-                with tempfile.TemporaryDirectory(dir=str(DB_PATH.parent)) as folder:
-                    candidate=Path(folder)/"candidate.sqlite"
-                    candidate.write_bytes(raw)
-                    with sqlite3.connect(f"file:{candidate}?mode=ro",uri=True) as check:
-                        if check.execute("PRAGMA quick_check").fetchone()[0]!="ok":
-                            raise ValueError("SQLite integrity check failed.")
-                        tables={r[0] for r in check.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-                        if not {"predictions","historical_learning"}.issubset(tables):
-                            raise ValueError("The backup does not contain the required prediction tables.")
-                    # A clean SQLite backup has no live WAL; remove stale WAL files after replacement.
-                    os.replace(candidate,DB_PATH)
-                    for suffix in ("-wal","-shm"):
-                        Path(str(DB_PATH)+suffix).unlink(missing_ok=True)
-                st.success("Backup restored. Refresh the app to load the restored records.")
+                manifest = json.loads(manifest_upload.getvalue())
+                parts = manifest.get("parts", [])
+                if (manifest.get("format") != "asx-split-backup-v1" or not parts or
+                    len(parts) > 1000 or any(x.get("name") != f"asx_backup.part{i:03d}" or
+                    not isinstance(x.get("size"), int) or not 0 < x["size"] <= BACKUP_CHUNK_BYTES or
+                    len(str(x.get("sha256", ""))) != 64 for i, x in enumerate(parts, 1))):
+                    raise ValueError("Invalid backup manifest")
+                RESTORE_STAGE.mkdir(parents=True, exist_ok=True)
+                for old in RESTORE_STAGE.glob("asx_backup.part*"):
+                    old.unlink()
+                (RESTORE_STAGE / "manifest.json").write_text(json.dumps(manifest))
+                st.success("Manifest accepted. Upload part 1 below.")
             except Exception as exc:
-                st.error(f"Restore failed; no database changes were intended: {exc}")
-
+                st.error(f"Invalid manifest: {exc}")
+        manifest_path = RESTORE_STAGE / "manifest.json"
+        if manifest_path.exists():
+            manifest = json.loads(manifest_path.read_text())
+            parts = manifest["parts"]
+            next_index = next((i for i, part in enumerate(parts) if not (RESTORE_STAGE / part["name"]).exists()), len(parts))
+            st.write(f"Received {next_index} of {len(parts)} parts")
+            if next_index < len(parts):
+                expected = parts[next_index]
+                upload = st.file_uploader(f"Upload {expected['name']} (part {next_index+1}/{len(parts)})", key=f"restore_part_{next_index}")
+                if st.button("Save uploaded part", disabled=upload is None, key=f"restore_save_{next_index}"):
+                    try:
+                        if upload.size != expected["size"]:
+                            raise ValueError("Part size does not match manifest")
+                        candidate = RESTORE_STAGE / "incoming.part"
+                        with open(candidate, "wb") as out:
+                            while True:
+                                block = upload.read(4 * 1024 * 1024)
+                                if not block:
+                                    break
+                                out.write(block)
+                        if _stream_sha256(candidate) != expected["sha256"]:
+                            candidate.unlink(missing_ok=True)
+                            raise ValueError("Part checksum mismatch")
+                        os.replace(candidate, RESTORE_STAGE / expected["name"])
+                        st.success("Part saved.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Part rejected: {exc}")
+            else:
+                st.success("All parts received and verified.")
+                confirmed = st.checkbox("I understand this replaces ALL existing prediction and backtest records", key="restore_split_confirm")
+                if st.button("Verify and restore database", disabled=not confirmed, key="restore_split_apply"):
+                    try:
+                        with st.spinner("Reassembling, checking and restoring database…"):
+                            archive = RESTORE_STAGE / "reassembled.zip"
+                            with open(archive, "wb") as out:
+                                for part in parts:
+                                    with open(RESTORE_STAGE / part["name"], "rb") as inp:
+                                        shutil.copyfileobj(inp, out, 4 * 1024 * 1024)
+                            if archive.stat().st_size != manifest["archive_size"] or _stream_sha256(archive) != manifest["archive_sha256"]:
+                                raise ValueError("Archive verification failed")
+                            candidate = DB_PATH.with_name("asx_restore_candidate.sqlite")
+                            with zipfile.ZipFile(archive) as z:
+                                names = z.namelist()
+                                if names != ["asx_prediction_history.sqlite"]:
+                                    raise ValueError("Unexpected backup archive contents")
+                                with z.open(names[0]) as inp, open(candidate, "wb") as out:
+                                    shutil.copyfileobj(inp, out, 4 * 1024 * 1024)
+                            _sqlite_validate(candidate)
+                            # Preserve the previous database until the replacement is validated.
+                            # Close any active app DB users before replacing it.
+                            if DB_PATH.exists():
+                                with sqlite3.connect(str(DB_PATH), timeout=60) as current:
+                                    current.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                            os.replace(candidate, DB_PATH)
+                            st.session_state.pop("sqlite_backup_bytes", None)
+                        st.success("Database restored and validated. Refresh the app before running another scan.")
+                    except Exception as exc:
+                        st.error(f"Restore failed: {exc}. The current database was not intentionally replaced unless the final replacement completed.")
 
 def component_scores(row):
     def val(k):
