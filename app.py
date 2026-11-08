@@ -1080,6 +1080,125 @@ def backtest_metrics(frame, horizon):
         "Negative return %": values.lt(0).mean()*100 if len(values) else np.nan,
     }
 
+
+
+def run_strategy_optimiser(frame, fee_pct=0.6, minimum_price=0.05):
+    """Select rules on validation only; report final unseen chronological test separately.
+
+    Forward close-to-close returns are proxies, not executable trade fills.
+    """
+    if frame is None or frame.empty:
+        return None, "No historical signals are available."
+    data=frame.copy()
+    data["Signal date"]=pd.to_datetime(data["Signal date"],errors="coerce")
+    for field in ("Score","VPA Score","Accumulation Score","Distribution Safety","Entry price"):
+        data[field]=pd.to_numeric(data[field],errors="coerce") if field in data else np.nan
+    for h in (5,10,20,30):
+        col=f"Return {h}d %"
+        data[col]=pd.to_numeric(data[col],errors="coerce") if col in data else np.nan
+    data=data.dropna(subset=["Signal date","Ticker","Entry price"])
+    data=data[(data["Entry price"]>=minimum_price)&(data["Entry price"]>0)]
+    data=data.sort_values("Signal date")
+    dates=np.array(sorted(data["Signal date"].unique()))
+    if len(dates)<90:
+        return None,"Need at least 90 distinct signal dates to make a meaningful time-separated comparison."
+    first=pd.Timestamp(dates[int(len(dates)*0.60)])
+    second=pd.Timestamp(dates[int(len(dates)*0.80)])
+    gap=pd.Timedelta(days=45)
+    train=data[data["Signal date"]<first-gap]
+    validation=data[(data["Signal date"]>=first)&(data["Signal date"]<second-gap)]
+    test=data[data["Signal date"]>=second]
+    if len(validation)<80 or len(test)<80:
+        return None,"Insufficient validation or test observations after the 45-day outcome gaps."
+    candidates=[]
+    # Predeclared grid avoids trying hundreds of arbitrary thresholds on small samples.
+    for score in (55,65,75,85):
+        for vpa in (None,65,75):
+            for accum in (None,65):
+                for safety in (None,70):
+                    candidates.append((score,vpa,accum,safety))
+    def select(df,rule):
+        score,vpa,accum,safety=rule
+        mask=df["Score"]>=score
+        if vpa is not None: mask &= df["VPA Score"]>=vpa
+        if accum is not None: mask &= df["Accumulation Score"]>=accum
+        if safety is not None: mask &= df["Distribution Safety"]>=safety
+        return df.loc[mask]
+    def metrics(df,h):
+        values=(df[f"Return {h}d %"]-fee_pct).replace([np.inf,-np.inf],np.nan).dropna()
+        if values.empty: return None
+        return {"Trades":int(len(values)),"Average net return %":float(values.mean()),
+                "Median net return %":float(values.median()),"Win rate %":float(values.gt(0).mean()*100),
+                "Total positive %":float(values[values>0].sum()),"Total negative %":float(values[values<0].sum())}
+    ranked=[]
+    for rule in candidates:
+        for h in (5,10,20,30):
+            val=metrics(select(validation,rule),h)
+            if val is None or val["Trades"]<30: continue
+            # Prefer robust median and positive expectancy; penalty for few observations.
+            quality=val["Average net return %"]*0.5+val["Median net return %"]*0.5
+            ranked.append((quality,rule,h,val))
+    if not ranked: return None,"No strategy had at least 30 completed validation signals. Try lowering the minimum price."
+    ranked.sort(key=lambda x:x[0],reverse=True)
+    rows=[]
+    for rank,(_,rule,h,val) in enumerate(ranked[:10],1):
+        tst=metrics(select(test,rule),h)
+        rows.append({"Validation rank":rank,"Score min":rule[0],"VPA min":rule[1],
+                     "Accumulation min":rule[2],"Distribution risk max":100-rule[3] if rule[3] is not None else None,
+                     "Hold days":h,"Validation trades":val["Trades"],
+                     "Validation mean net %":round(val["Average net return %"],2),
+                     "Validation median net %":round(val["Median net return %"],2),
+                     "Test trades":tst["Trades"] if tst else 0,
+                     "Test mean net %":round(tst["Average net return %"],2) if tst else np.nan,
+                     "Test median net %":round(tst["Median net return %"],2) if tst else np.nan,
+                     "Test win %":round(tst["Win rate %"],1) if tst else np.nan})
+    winner=ranked[0]
+    selected=select(test,winner[1])
+    # Daily close equity simulation is not justified by overlapping fixed-horizon outcomes.
+    return {"table":pd.DataFrame(rows),"train_rows":len(train),"validation_rows":len(validation),
+            "test_rows":len(test),"validation_start":str(first.date()),"test_start":str(second.date()),
+            "best_test":metrics(selected,winner[2]),"grid_size":len(candidates)*4},None
+
+
+def render_strategy_optimiser(bt):
+    st.subheader("Trading Strategy Optimiser — experimental")
+    st.caption("Selects rules on a middle validation period, then reports results on a later untouched test period. "
+               "No model is fitted here; the earlier training segment is reserved for future model training. "
+               "The test results must not be used to repeatedly tune the same rules.")
+    a,b=st.columns(2)
+    with a:
+        costs=st.slider("Estimated round-trip trading costs (%)",0.0,5.0,0.8,0.1,key="opt_costs")
+    with b:
+        min_price=st.selectbox("Minimum historical share price (AUD)",[0.01,0.05,0.10,0.20,0.50,1.00],index=2,key="opt_minprice")
+    st.caption("Costs combine estimated entry/exit brokerage, spread and slippage. The minimum price is NOT a liquidity test. "
+               "Historical average dollar volume, real bid/ask fills, stop-loss/take-profit paths and portfolio drawdown "
+               "are not available from this sampled signal table and are not simulated.")
+    if st.button("Run strategy optimiser",key="opt_run"):
+        with st.spinner("Comparing historical strategies..."):
+            result,error=run_strategy_optimiser(bt,costs,min_price)
+        st.session_state["opt_result"]={"result":result,"error":error,"costs":costs,"price":min_price,
+                                         "n":len(bt),"last":str(bt["Signal date"].max())}
+    saved=st.session_state.get("opt_result")
+    if saved:
+        if (saved["costs"],saved["price"],saved["n"],saved["last"])!=(costs,min_price,len(bt),str(bt["Signal date"].max())):
+            st.info("Settings or historical sample changed. Run the optimiser again.")
+        elif saved["error"]:
+            st.warning(saved["error"])
+        else:
+            result=saved["result"]
+            st.caption(f"Compared {result['grid_size']} rule/horizon combinations; "
+                       f"validation begins {result['validation_start']}, unseen test begins {result['test_start']}. "
+                       f"Rows: reserved training {result['train_rows']:,}, validation {result['validation_rows']:,}, "
+                       f"test {result['test_rows']:,}.")
+            st.dataframe(result["table"],use_container_width=True,hide_index=True)
+            st.download_button("Download optimiser results CSV",result["table"].to_csv(index=False).encode(),
+                               file_name="asx_strategy_optimiser_results.csv",mime="text/csv",key="opt_csv")
+            st.warning("Exploratory only: fixed-horizon close returns assume fills at the signal close, "
+                       "overlapping trades are not portfolio returns, historical delisted shares are missing, "
+                       "and the displayed historical sample is downsampled by ticker. "
+                       "No max drawdown, stop-loss/take-profit execution or benchmark outperformance is claimed. "
+                       "Validate the best rule on fresh, never-used signals before risking capital.")
+
 def evaluate_learned_holdout(frame, threshold):
     """Train on early matured observations, then compare fixed/adaptive scores on later rows."""
     if frame is None or len(frame)<60:
@@ -2051,6 +2170,7 @@ elif page=="Phase 4 Backtest":
                 diagnostics.append({"Indicator":feature,"Sample count":len(pair),"Correlation with forward return":corr})
         st.dataframe(pd.DataFrame(diagnostics).round(3),use_container_width=True,hide_index=True)
         st.download_button("Download displayed backtest rows CSV",bt.to_csv(index=False).encode(),file_name="asx_phase4_historical_backtest_sample.csv",mime="text/csv")
+        render_strategy_optimiser(bt)
         st.subheader("Did learned weights help on later, unseen history?")
         st.write("This check trains weights only on matured outcomes from earlier dates, leaves a 45-day gap, then compares fixed and learned scores on the later holdout period. It tests whether the indicators ranked the later sample better; it cannot guarantee future performance.")
         holdout_key=(tuple(sorted(backtest_codes)),int(interval),int(cutoff))
