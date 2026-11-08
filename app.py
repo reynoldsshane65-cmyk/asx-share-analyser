@@ -1686,7 +1686,6 @@ def render_automatic_strategy_testing(bt):
     st.dataframe(pd.DataFrame([{'Reason':k,'Rejected signals':v} for k,v in result.get('skipped',{}).items()]),hide_index=True,use_container_width=True)
     st.caption(f"Eligible candidates: {stats['Candidate signals']}; eligible tickers: {stats.get('Eligible tickers', 'unknown')}.")
     render_walk_forward_testing(bt, rule, hold, saved, capital, positions, allocation, liquidity, participation)
-    render_filter_effectiveness_analyser(bt, rule, hold, saved, liquidity)
     st.warning('The optimiser rule was already selected using this historical dataset, so this is not a fully independent test of the entire strategy. Repeated runs and parameter changes on the same holdout introduce overfitting. Signals are sampled; delisted shares, execution uncertainty and corporate-action data can affect results. Forward paper testing is needed.')
 
 
@@ -2805,6 +2804,31 @@ elif page=="Phase 4 Backtest":
         render_strategy_optimiser(bt)
         render_portfolio_simulator(bt)
         render_automatic_strategy_testing(bt)
+        # Independent of automatic strategy comparison / holdout completion.
+        st.divider()
+        st.subheader("50-day trend filter — accepted vs rejected")
+        fe_saved = st.session_state.get("opt_result")
+        if (fe_saved and not fe_saved.get("error") and fe_saved.get("result")
+                and fe_saved.get("n") == len(bt)
+                and fe_saved.get("last") == str(bt["Signal date"].max())):
+            fe_top = fe_saved["result"]["table"].iloc[0]
+            fe_rule = (int(fe_top["Score min"]),
+                       None if pd.isna(fe_top["VPA min"]) else float(fe_top["VPA min"]),
+                       None if pd.isna(fe_top["Accumulation min"]) else float(fe_top["Accumulation min"]),
+                       None if pd.isna(fe_top["Distribution risk max"]) else 100 - float(fe_top["Distribution risk max"]))
+            fe_hold = int(fe_top["Hold days"])
+            fe_config = fe_saved
+            st.caption("Using the current optimiser's score rules and holding period.")
+        else:
+            st.caption("No current optimiser results: use independent settings below to test the cached history.")
+            fe_score = st.slider("Minimum signal score for filter comparison", 0, 100, int(cutoff), key="fe_independent_score")
+            fe_hold = st.selectbox("Strategy holding period (trading sessions)", [5, 10, 20, 30], index=2, key="fe_independent_hold")
+            fe_cost = st.number_input("Estimated round-trip trading costs (%)", min_value=0.0, max_value=10.0, value=0.8, step=0.1, key="fe_independent_cost")
+            fe_price = st.number_input("Minimum share price (AUD)", min_value=0.0, max_value=100.0, value=0.01, step=0.01, key="fe_independent_price")
+            fe_rule = (fe_score, None, None, None)
+            fe_config = {"costs": fe_cost, "price": fe_price}
+        fe_liquidity = st.number_input("Minimum average daily dollar volume (AUD) — filter comparison", min_value=0.0, value=20000.0, step=1000.0, key="fe_independent_liquidity")
+        render_filter_effectiveness_analyser(bt, fe_rule, fe_hold, fe_config, fe_liquidity)
         st.subheader("Did learned weights help on later, unseen history?")
         st.write("This check trains weights only on matured outcomes from earlier dates, leaves a 45-day gap, then compares fixed and learned scores on the later holdout period. It tests whether the indicators ranked the later sample better; it cannot guarantee future performance.")
         holdout_key=(tuple(sorted(backtest_codes)),int(interval),int(cutoff))
