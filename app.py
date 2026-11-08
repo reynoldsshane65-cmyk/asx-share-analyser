@@ -1340,6 +1340,109 @@ def simulate_historical_portfolio(signals, rule, hold_days, start_date, capital=
     return {'equity':eq,'trades':trades,'stats':stats,'skipped':skipped,'rejected':rejected},None
 
 
+def render_automatic_strategy_testing(bt):
+    """Validation-only parameter search with one later chronological holdout run."""
+    st.subheader('Automatic Strategy Testing — experimental')
+    st.caption('Automatically compares entry quality filters on an earlier validation window, then runs only the validation winner on a later holdout. The holdout is not reusable as an untouched test after you inspect it.')
+    saved=st.session_state.get('opt_result')
+    if not saved or saved.get('error') or not saved.get('result'):
+        st.info('Run the Trading Strategy Optimiser above first.')
+        return
+    if saved.get('n')!=len(bt) or saved.get('last')!=str(bt['Signal date'].max()):
+        st.info('Historical signals have changed. Rerun the optimiser first.')
+        return
+    opt=saved['result']
+    top=opt['table'].iloc[0]
+    rule=(int(top['Score min']), None if pd.isna(top['VPA min']) else float(top['VPA min']),
+          None if pd.isna(top['Accumulation min']) else float(top['Accumulation min']),
+          None if pd.isna(top['Distribution risk max']) else 100-float(top['Distribution risk max']))
+    hold=int(top['Hold days'])
+    # Keep a 45-day separation between signal windows to reduce overlap of outcomes.
+    dates=pd.to_datetime(bt['Signal date'],errors='coerce').dropna().sort_values().unique()
+    if len(dates)<90:
+        st.info('At least 90 distinct historical signal dates are needed for time-separated testing.')
+        return
+    boundary=pd.Timestamp(dates[int(len(dates)*0.8)]).normalize()
+    val_start=pd.Timestamp(dates[int(len(dates)*0.6)]).normalize()
+    val_end=boundary-pd.Timedelta(days=45)
+    if val_end<=val_start:
+        st.info('Not enough time between validation and holdout periods.')
+        return
+    a,b,c=st.columns(3)
+    with a:
+        capital=st.number_input('Test starting capital (AUD)',min_value=1000.0,value=10000.0,step=1000.0,key='auto_capital')
+        positions=st.slider('Test maximum concurrent positions',1,20,5,key='auto_positions')
+    with b:
+        allocation=st.slider('Test allocation per trade (%)',1,50,10,key='auto_allocation')
+        liquidity=st.number_input('Test minimum daily dollar volume (AUD)',min_value=0.0,value=20000.0,step=10000.0,key='auto_liquidity')
+    with c:
+        participation=st.slider('Test maximum daily-volume participation (%)',0.1,10.0,2.0,0.1,key='auto_participation')
+        min_trades=st.slider('Minimum validation trades',5,50,15,key='auto_min_trades')
+    st.caption(f'Validation signals: {val_start.date()} to {val_end.date()}; holdout signals from {boundary.date()}. The rule and holding period come from validation-ranked optimiser results. Costs: {saved["costs"]:.1f}%.')
+    # Predefined, limited grid: avoid an unrestricted search that would overfit small samples.
+    configs=[(v,t) for v in (0,2,3,4,5,7,10) for t in (False,True)]
+    signature=(len(bt),str(bt['Signal date'].max()),tuple(rule),hold,capital,positions,allocation,liquidity,participation,min_trades,saved['costs'],saved['price'])
+    if st.button('Run automatic strategy comparison',key='auto_run'):
+        rows=[]
+        validation=bt[(pd.to_datetime(bt['Signal date'])>=val_start)&(pd.to_datetime(bt['Signal date'])<=val_end)].copy()
+        bar=st.progress(0,text='Comparing entry filters on validation data...')
+        for i,(vol,trend) in enumerate(configs):
+            result,error=simulate_historical_portfolio(validation,rule,hold,val_start,capital,
+                allocation,positions,saved['costs'],saved['price'],liquidity,participation,
+                0,0,0,'Score',vol,trend)
+            if result and not error:
+                stats=result['stats']; trades=result['trades']
+                n=int(stats['Closed trades'])
+                pnl=pd.to_numeric(trades['Net P&L AUD'],errors='coerce') if not trades.empty else pd.Series(dtype=float)
+                gross_profit=float(pnl[pnl>0].sum()); gross_loss=-float(pnl[pnl<0].sum())
+                pf=gross_profit/gross_loss if gross_loss>0 else (float('inf') if gross_profit>0 else 0)
+                rows.append({'Volatility max %':vol,'Require 50D uptrend':trend,
+                    'Total return %':stats['Total return %'],'Maximum drawdown %':stats['Maximum drawdown %'],
+                    'Win rate %':stats['Win rate %'],'Trades':n,'Profit factor':pf})
+            bar.progress((i+1)/len(configs),text=f'Tested {i+1}/{len(configs)} combinations')
+        bar.empty()
+        frame=pd.DataFrame(rows)
+        if frame.empty:
+            st.session_state['auto_result']={'signature':signature,'error':'No valid validation simulations.','table':None}
+        else:
+            # Prefer net profitability and manageable drawdown; reject sparse samples.
+            eligible=frame[frame['Trades']>=min_trades].copy()
+            if eligible.empty:
+                st.session_state['auto_result']={'signature':signature,'error':'No combination met the minimum validation trade count.','table':frame}
+            else:
+                eligible['Ranking score']=eligible['Total return %']+eligible['Maximum drawdown %']*1.5
+                eligible=eligible.sort_values(['Ranking score','Profit factor'],ascending=False)
+                winner=eligible.iloc[0]
+                holdout=bt[pd.to_datetime(bt['Signal date'])>=boundary].copy()
+                final,final_error=simulate_historical_portfolio(holdout,rule,hold,boundary,capital,
+                    allocation,positions,saved['costs'],saved['price'],liquidity,participation,
+                    0,0,0,'Score',float(winner['Volatility max %']),bool(winner['Require 50D uptrend']))
+                st.session_state['auto_result']={'signature':signature,'error':final_error,'table':eligible,
+                    'winner':winner.to_dict(),'holdout':final,'validation_start':str(val_start.date()),
+                    'validation_end':str(val_end.date()),'holdout_start':str(boundary.date())}
+    record=st.session_state.get('auto_result')
+    if not record: return
+    if record['signature']!=signature:
+        st.info('Inputs changed. Rerun the automatic comparison.'); return
+    if record.get('table') is not None:
+        st.markdown('**Validation ranking (not holdout results)**')
+        st.dataframe(record['table'].replace([np.inf,-np.inf],np.nan).round(2),hide_index=True,use_container_width=True)
+        st.download_button('Download strategy comparison CSV',record['table'].to_csv(index=False).encode(),
+                           file_name='asx_automatic_strategy_comparison.csv',mime='text/csv',key='auto_csv')
+    if record.get('error'):
+        st.warning(record['error']); return
+    winner=record['winner']; result=record['holdout']; stats=result['stats']
+    st.markdown('**Later holdout — selected strategy only**')
+    st.write(f"Selected on validation: volatility {'OFF' if winner['Volatility max %']==0 else str(int(winner['Volatility max %']))+'%'}; 50-day uptrend {'ON' if winner['Require 50D uptrend'] else 'OFF'}.")
+    metrics=st.columns(4)
+    metrics[0].metric('Holdout total return',f"{stats['Total return %']:+.2f}%")
+    metrics[1].metric('Holdout max drawdown',f"{stats['Maximum drawdown %']:.2f}%")
+    metrics[2].metric('Holdout win rate',f"{stats['Win rate %']:.1f}%")
+    metrics[3].metric('Holdout closed trades',str(stats['Closed trades']))
+    st.line_chart(result['equity'].set_index('Date')['Equity AUD'])
+    st.warning('The optimiser rule was already selected using this historical dataset, so this is not a fully independent test of the entire strategy. Repeated runs and parameter changes on the same holdout introduce overfitting. Signals are sampled; delisted shares, execution uncertainty and corporate-action data can affect results. Forward paper testing is needed.')
+
+
 def render_portfolio_simulator(bt):
     st.subheader('Trade-by-Trade Portfolio Simulator — experimental')
     st.caption('Uses the validation-ranked strategy from the optimiser and tests it chronologically on the later period. '
@@ -2454,6 +2557,7 @@ elif page=="Phase 4 Backtest":
         st.download_button("Download displayed backtest rows CSV",bt.to_csv(index=False).encode(),file_name="asx_phase4_historical_backtest_sample.csv",mime="text/csv")
         render_strategy_optimiser(bt)
         render_portfolio_simulator(bt)
+        render_automatic_strategy_testing(bt)
         st.subheader("Did learned weights help on later, unseen history?")
         st.write("This check trains weights only on matured outcomes from earlier dates, leaves a 45-day gap, then compares fixed and learned scores on the later holdout period. It tests whether the indicators ranked the later sample better; it cannot guarantee future performance.")
         holdout_key=(tuple(sorted(backtest_codes)),int(interval),int(cutoff))
