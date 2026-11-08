@@ -1199,6 +1199,175 @@ def render_strategy_optimiser(bt):
                        "No max drawdown, stop-loss/take-profit execution or benchmark outperformance is claimed. "
                        "Validate the best rule on fresh, never-used signals before risking capital.")
 
+
+
+def simulate_historical_portfolio(signals, rule, hold_days, start_date, capital=10000.0,
+                                  position_pct=10, max_positions=5, costs_pct=0.8,
+                                  min_price=0.10, min_dollar_volume=20000.0,
+                                  participation_pct=2.0):
+    """Chronological paper portfolio using cached daily bars, never future signal returns.
+
+    Enter at next available session OPEN, exit at CLOSE after hold_days sessions.
+    Signals are generated at signal-day close; use only prior 20 bars for liquidity.
+    """
+    data=signals.copy()
+    data['Signal date']=pd.to_datetime(data['Signal date'],errors='coerce').dt.normalize()
+    for col in ('Score','VPA Score','Accumulation Score','Distribution Safety'):
+        data[col]=pd.to_numeric(data[col],errors='coerce') if col in data else np.nan
+    score,vpa,accum,safety=rule
+    mask=(data['Score']>=score)&(data['Signal date']>=pd.Timestamp(start_date))
+    if vpa is not None: mask &= data['VPA Score']>=vpa
+    if accum is not None: mask &= data['Accumulation Score']>=accum
+    if safety is not None: mask &= data['Distribution Safety']>=safety
+    data=data.loc[mask].dropna(subset=['Signal date','Ticker']).sort_values(['Signal date','Score'],ascending=[True,False])
+    if data.empty: return None,'No signals qualified in the later test period.'
+    price_map={}
+    candidates=[]
+    skipped={'missing prices':0,'liquidity':0,'price':0,'no next open':0}
+    for ticker, group in data.groupby('Ticker'):
+        bars=load_historical_prices(str(ticker))
+        if bars.empty: skipped['missing prices']+=len(group); continue
+        bars=bars[~bars.index.duplicated(keep='last')].sort_index().copy()
+        for col in ('Open','Close','Volume'):
+            bars[col]=pd.to_numeric(bars[col],errors='coerce')
+        bars['Prior dollar volume']= (bars['Close']*bars['Volume']).shift(1).rolling(20,min_periods=20).mean()
+        price_map[ticker]=bars
+        for _,row in group.iterrows():
+            day=row['Signal date']
+            ix=int(bars.index.searchsorted(day,side='right'))
+            if ix>=len(bars): skipped['no next open']+=1; continue
+            entry=bars.iloc[ix]
+            if not np.isfinite(entry['Open']) or entry['Open']<=0: skipped['no next open']+=1; continue
+            if entry['Open']<min_price: skipped['price']+=1; continue
+            adv=entry['Prior dollar volume']
+            if not np.isfinite(adv) or adv<min_dollar_volume: skipped['liquidity']+=1; continue
+            exit_ix=ix+int(hold_days)-1
+            if exit_ix>=len(bars): skipped['missing prices']+=1; continue
+            exit_bar=bars.iloc[exit_ix]
+            if not np.isfinite(exit_bar['Close']) or exit_bar['Close']<=0: skipped['missing prices']+=1; continue
+            candidates.append({'ticker':ticker,'entry_date':bars.index[ix], 'exit_date':bars.index[exit_ix],
+                               'entry_price':float(entry['Open']),'exit_price':float(exit_bar['Close']),
+                               'adv':float(adv),'score':float(row['Score'])})
+    if not candidates: return None,'No trades passed the cached-price and liquidity checks. Lower liquidity threshold or expand history.'
+    candidates.sort(key=lambda x:(x['entry_date'],-x['score'],x['ticker']))
+    dates=sorted(set().union(*(set(b.index[(b.index>=pd.Timestamp(start_date)) &
+                                   (b.index<=max(x['exit_date'] for x in candidates))]) for b in price_map.values())))
+    if not dates: return None,'No daily price history available for equity calculation.'
+    by_date={}
+    for x in candidates: by_date.setdefault(x['entry_date'],[]).append(x)
+    cash=float(capital); positions={}; ledger=[]; equity_rows=[]
+    half_cost=costs_pct/200.0
+    rejected={'full portfolio':0,'already held':0,'cash or participation':0}
+    last_prices={}
+    for day in dates:
+        # Exit at session close. Entries use session open and are evaluated before close exits.
+        for x in by_date.get(day,[]):
+            t=x['ticker']
+            if t in positions: rejected['already held']+=1; continue
+            if len(positions)>=max_positions: rejected['full portfolio']+=1; continue
+            # Size against portfolio value at last known closes, not future closes.
+            marked=cash+sum(pos['shares']*last_prices.get(tk,pos['entry_price']) for tk,pos in positions.items())
+            budget=min(marked*position_pct/100.0, x['adv']*participation_pct/100.0, cash)
+            shares=int(budget/(x['entry_price']*(1+half_cost)))
+            if shares<1: rejected['cash or participation']+=1; continue
+            spend=shares*x['entry_price']*(1+half_cost)
+            cash-=spend
+            positions[t]={**x,'shares':shares,'spend':spend}
+        for t,pos in list(positions.items()):
+            if pos['exit_date']<=day:
+                proceeds=pos['shares']*pos['exit_price']*(1-half_cost)
+                cash+=proceeds
+                ledger.append({'Ticker':t,'Entry date':str(pos['entry_date'].date()),
+                               'Exit date':str(day.date()),'Shares':pos['shares'],
+                               'Entry open':pos['entry_price'],'Exit close':pos['exit_price'],
+                               'Cost AUD':round(pos['spend'],2),'Proceeds AUD':round(proceeds,2),
+                               'Net P&L AUD':round(proceeds-pos['spend'],2),
+                               'Net return %':round((proceeds/pos['spend']-1)*100,3),
+                               'Prior 20d avg dollar volume':round(pos['adv'],2)})
+                del positions[t]
+        for t in positions:
+            b=price_map[t]
+            if day in b.index and np.isfinite(b.loc[day,'Close']) and b.loc[day,'Close']>0:
+                last_prices[t]=float(b.loc[day,'Close'])
+        equity=cash+sum(pos['shares']*last_prices.get(t,pos['entry_price']) for t,pos in positions.items())
+        equity_rows.append({'Date':day,'Equity AUD':equity,'Cash AUD':cash,'Open positions':len(positions)})
+    eq=pd.DataFrame(equity_rows)
+    eq['Peak AUD']=eq['Equity AUD'].cummax().clip(lower=capital)
+    eq['Drawdown %']=(eq['Equity AUD']/eq['Peak AUD']-1)*100
+    trades=pd.DataFrame(ledger)
+    end_equity=float(eq['Equity AUD'].iloc[-1]); days=max((eq['Date'].iloc[-1]-eq['Date'].iloc[0]).days,1)
+    stats={'Starting balance AUD':capital,'Ending balance AUD':end_equity,
+           'Total return %':(end_equity/capital-1)*100,
+           'Annualised return %':((end_equity/capital)**(365.25/days)-1)*100 if end_equity>0 else -100,
+           'Maximum drawdown %':float(eq['Drawdown %'].min()),
+           'Closed trades':len(trades),'Win rate %':float((trades['Net P&L AUD']>0).mean()*100) if len(trades) else np.nan,
+           'Open positions at end':len(positions),'Candidate signals':len(candidates)}
+    return {'equity':eq,'trades':trades,'stats':stats,'skipped':skipped,'rejected':rejected},None
+
+
+def render_portfolio_simulator(bt):
+    st.subheader('Trade-by-Trade Portfolio Simulator — experimental')
+    st.caption('Uses the validation-ranked strategy from the optimiser and tests it chronologically on the later period. '
+               'Entries are at the next session open, exits at the close after the chosen number of trading sessions. '
+               'Uses cached historical daily prices, not broker executions.')
+    saved=st.session_state.get('opt_result')
+    if not saved or saved.get('error') or not saved.get('result'):
+        st.info('Run the Trading Strategy Optimiser above first to select a rule using validation data only.')
+        return
+    opt=saved['result']
+    if saved.get('n')!=len(bt) or saved.get('last')!=str(bt['Signal date'].max()):
+        st.info('The historical sample changed. Run the optimiser again before simulating.')
+        return
+    table=opt['table']
+    if table.empty: return
+    rank=st.selectbox('Strategy chosen by validation rank',list(range(1,len(table)+1)),index=0,key='sim_rank')
+    r=table.iloc[rank-1]
+    rule=(int(r['Score min']),None if pd.isna(r['VPA min']) else float(r['VPA min']),
+          None if pd.isna(r['Accumulation min']) else float(r['Accumulation min']),
+          None if pd.isna(r['Distribution risk max']) else 100-float(r['Distribution risk max']))
+    st.write(f"Score ≥{rule[0]}, VPA ≥{rule[1] if rule[1] is not None else 'any'}, accumulation ≥{rule[2] if rule[2] is not None else 'any'}, "
+             f"distribution risk ≤{r['Distribution risk max'] if pd.notna(r['Distribution risk max']) else 'any'}; hold {int(r['Hold days'])} sessions")
+    a,b,c=st.columns(3)
+    with a:
+        capital=st.number_input('Starting capital (AUD)',min_value=1000.0,value=10000.0,step=1000.0,key='sim_capital')
+        max_positions=st.slider('Maximum concurrent positions',1,20,5,key='sim_max_positions')
+    with b:
+        allocation=st.slider('Target allocation per trade (%)',1,50,10,key='sim_allocation')
+        liquidity=st.number_input('Minimum prior 20-session avg dollar volume (AUD)',min_value=0.0,value=20000.0,step=10000.0,key='sim_liquidity')
+    with c:
+        participation=st.slider('Maximum position as % of average daily dollar volume',0.1,10.0,2.0,0.1,key='sim_participation')
+        st.caption(f"Round-trip costs {saved['costs']:.1f}%; minimum share price ${saved['price']:.2f} (from optimiser).")
+    st.warning('Research simulation only. Cached Yahoo prices may be adjusted or inconsistent across corporate actions; '
+               'liquidity uses historical daily volume rather than bid/ask depth. No stop-loss/take-profit execution, '
+               'dividends, tax, benchmark, delisted-stock coverage, or guaranteed fills. Signals are sampled, not all daily opportunities.')
+    settings=(rank,capital,max_positions,allocation,liquidity,participation,saved['costs'],saved['price'],len(bt),opt['test_start'])
+    if st.button('Run trade-by-trade simulation',key='sim_run'):
+        with st.spinner('Loading cached daily bars and simulating portfolio...'):
+            result,error=simulate_historical_portfolio(bt,rule,int(r['Hold days']),opt['test_start'],capital,
+                            allocation,max_positions,saved['costs'],saved['price'],liquidity,participation)
+        st.session_state['sim_result']={'settings':settings,'result':result,'error':error}
+    record=st.session_state.get('sim_result')
+    if not record: return
+    if record['settings']!=settings:
+        st.info('Simulation settings changed. Run again to refresh results.'); return
+    if record['error']:
+        st.warning(record['error']); return
+    result=record['result']; stats=result['stats']
+    cols=st.columns(4)
+    for col,key,fmt in zip(cols,('Ending balance AUD','Total return %','Maximum drawdown %','Closed trades'),
+                           ('${:,.2f}','{:+.2f}%','{:.2f}%','{:,.0f}')):
+        col.metric(key,fmt.format(stats[key]))
+    st.caption(f"Win rate: {stats['Win rate %']:.1f}% | Annualised return: {stats['Annualised return %']:+.2f}% | "
+               f"Candidates: {stats['Candidate signals']:,} | Open positions at end: {stats['Open positions']}")
+    st.line_chart(result['equity'].set_index('Date')['Equity AUD'])
+    st.write('**Closed trades**')
+    st.dataframe(result['trades'],use_container_width=True,hide_index=True)
+    st.download_button('Download simulated trades CSV',result['trades'].to_csv(index=False).encode(),
+                       'asx_simulated_trades.csv','text/csv',key='sim_trades_csv')
+    st.download_button('Download daily equity CSV',result['equity'].to_csv(index=False).encode(),
+                       'asx_simulated_equity.csv','text/csv',key='sim_equity_csv')
+    st.caption(f"Rejected before candidate creation: {result['skipped']}; portfolio constraints: {result['rejected']}.")
+
 def evaluate_learned_holdout(frame, threshold):
     """Train on early matured observations, then compare fixed/adaptive scores on later rows."""
     if frame is None or len(frame)<60:
@@ -2171,6 +2340,7 @@ elif page=="Phase 4 Backtest":
         st.dataframe(pd.DataFrame(diagnostics).round(3),use_container_width=True,hide_index=True)
         st.download_button("Download displayed backtest rows CSV",bt.to_csv(index=False).encode(),file_name="asx_phase4_historical_backtest_sample.csv",mime="text/csv")
         render_strategy_optimiser(bt)
+        render_portfolio_simulator(bt)
         st.subheader("Did learned weights help on later, unseen history?")
         st.write("This check trains weights only on matured outcomes from earlier dates, leaves a 45-day gap, then compares fixed and learned scores on the later holdout period. It tests whether the indicators ranked the later sample better; it cannot guarantee future performance.")
         holdout_key=(tuple(sorted(backtest_codes)),int(interval),int(cutoff))
