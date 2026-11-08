@@ -1206,7 +1206,7 @@ def simulate_historical_portfolio(signals, rule, hold_days, start_date, capital=
                                   min_price=0.10, min_dollar_volume=20000.0,
                                   participation_pct=2.0, stop_pct=0.0,
                                   target_pct=0.0, trailing_pct=0.0,
-                                  rank_method="Score"):
+                                  rank_method="Score", max_daily_volatility=0.0, require_uptrend=False):
     """Chronological daily-bar research simulation. Stops are conservative on ambiguous bars.
 
     Signals known at close -> next available opening entry; prior 20-session liquidity.
@@ -1233,6 +1233,9 @@ def simulate_historical_portfolio(signals, rule, hold_days, start_date, capital=
         for col in ('Open','High','Low','Close','Volume'):
             bars[col]=pd.to_numeric(bars[col],errors='coerce')
         bars['Prior dollar volume']=(bars['Close']*bars['Volume']).shift(1).rolling(20,min_periods=20).mean()
+        # Entry filters only use bars completed BEFORE the entry session.
+        bars['Prior volatility %']=bars['Close'].pct_change().shift(1).rolling(20,min_periods=20).std()*100
+        bars['Prior 50D MA']=bars['Close'].shift(1).rolling(50,min_periods=50).mean()
         price_map[ticker]=bars
         for _,row in group.iterrows():
             ix=int(bars.index.searchsorted(row['Signal date'],side='right'))
@@ -1242,6 +1245,10 @@ def simulate_historical_portfolio(signals, rule, hold_days, start_date, capital=
             if entry['Open']<min_price: skipped['price']+=1; continue
             adv=entry['Prior dollar volume']
             if not np.isfinite(adv) or adv<min_dollar_volume: skipped['liquidity']+=1; continue
+            if max_daily_volatility>0 and (not np.isfinite(entry['Prior volatility %']) or entry['Prior volatility %']>max_daily_volatility):
+                skipped.setdefault('volatility filter',0); skipped['volatility filter']+=1; continue
+            if require_uptrend and (not np.isfinite(entry['Prior 50D MA']) or not np.isfinite(bars.iloc[ix-1]['Close']) or bars.iloc[ix-1]['Close']<=entry['Prior 50D MA']):
+                skipped.setdefault('trend filter',0); skipped['trend filter']+=1; continue
             end_ix=ix+int(hold_days)-1
             if end_ix>=len(bars): skipped['missing prices']+=1; continue
             window=bars.iloc[ix:end_ix+1]
@@ -1375,17 +1382,27 @@ def render_portfolio_simulator(bt):
         trailing=st.selectbox('Trailing stop (%)',[0,5,8,10,15,20],index=0,key='sim_trailing',format_func=lambda v:'Off' if v==0 else f'{v}%')
     ranking=st.selectbox('Choose candidates when positions are limited',
                          ['Score','Score + VPA + Accumulation'],key='sim_ranking')
+    st.markdown('**Consistent Returns — optional entry quality filters**')
+    q1,q2=st.columns(2)
+    with q1:
+        max_vol=st.selectbox('Maximum prior 20-day daily volatility (%)',
+                             [0,2,3,4,5,7,10],index=0,key='sim_quality_vol',
+                             format_func=lambda v:'Off' if v==0 else f'{v}%')
+    with q2:
+        uptrend=st.checkbox('Require previous close above prior 50-day average',
+                            value=False,key='sim_quality_trend')
+    st.caption('Filters use historical prices available before entry. They can reduce trades and may reduce returns; test against the unchanged baseline.')
     st.caption('Stops/targets use cached daily OHLC. Opening gaps fill at the open; if both intraday thresholds are touched, '
                'the stop is assumed first. Trailing peaks update after each day, so same-day high-to-low ordering is not assumed. '
                'These are approximate fills, not real orders.')
     st.warning('Research simulation only. Cached Yahoo prices may be adjusted or inconsistent across corporate actions; '
                'liquidity uses historical daily volume rather than bid/ask depth. Stop/target fills are approximate, '
                'dividends, tax, benchmark, delisted-stock coverage, or guaranteed fills. Signals are sampled, not all daily opportunities.')
-    settings=(rank,capital,max_positions,allocation,liquidity,participation,saved['costs'],saved['price'],len(bt),opt['test_start'],stop,target,trailing,ranking)
+    settings=(rank,capital,max_positions,allocation,liquidity,participation,saved['costs'],saved['price'],len(bt),opt['test_start'],stop,target,trailing,ranking,max_vol,uptrend)
     if st.button('Run trade-by-trade simulation',key='sim_run'):
         with st.spinner('Loading cached daily bars and simulating portfolio...'):
             result,error=simulate_historical_portfolio(bt,rule,int(r['Hold days']),opt['test_start'],capital,
-                            allocation,max_positions,saved['costs'],saved['price'],liquidity,participation,stop,target,trailing,ranking)
+                            allocation,max_positions,saved['costs'],saved['price'],liquidity,participation,stop,target,trailing,ranking,max_vol,uptrend)
         st.session_state['sim_result']={'settings':settings,'result':result,'error':error}
     record=st.session_state.get('sim_result')
     if not record: return
@@ -1400,7 +1417,7 @@ def render_portfolio_simulator(bt):
         col.metric(key,fmt.format(stats[key]))
     st.caption(f"Win rate: {stats['Win rate %']:.1f}% | Annualised return: {stats['Annualised return %']:+.2f}% | "
                f"Candidates: {stats['Candidate signals']:,} | Open positions at end: {stats['Open positions at end']}")
-    if stop or target or trailing or ranking!='Score':
+    if stop or target or trailing or ranking!='Score' or max_vol or uptrend:
         st.caption('Comparison with unchanged baseline using identical capital, costs, liquidity and position limits:')
         if st.button('Compare with unchanged baseline',key='sim_compare_baseline'):
             with st.spinner('Running baseline with no exits and score-only ranking...'):
@@ -1413,6 +1430,36 @@ def render_portfolio_simulator(bt):
                     {'Version':'Experimental',**{k:stats[k] for k in ('Total return %','Maximum drawdown %','Closed trades','Win rate %')}}
                 ]),hide_index=True,use_container_width=True)
                 st.caption('Exploratory comparison on the same historical test period. Changing settings based on this test makes it no longer untouched.')
+    st.markdown('**Consistent Returns Analyser**')
+    trades=result['trades']
+    if not trades.empty and 'Net return %' in trades:
+        net=pd.to_numeric(trades['Net return %'],errors='coerce').dropna()
+        wins=net[net>0]; losses=net[net<0]
+        gross_profit=float(pd.to_numeric(trades.loc[trades['Net P&L AUD']>0,'Net P&L AUD']).sum())
+        gross_loss=abs(float(pd.to_numeric(trades.loc[trades['Net P&L AUD']<0,'Net P&L AUD']).sum()))
+        factor=gross_profit/gross_loss if gross_loss>0 else float('inf') if gross_profit>0 else float('nan')
+        longest=streak=0
+        for value in net:
+            streak=streak+1 if value<=0 else 0
+            longest=max(longest,streak)
+        m=st.columns(5)
+        m[0].metric('Profit factor',f'{factor:.2f}' if np.isfinite(factor) else 'N/A')
+        m[1].metric('Avg winner',f'{wins.mean():+.2f}%' if len(wins) else 'N/A')
+        m[2].metric('Avg loser',f'{losses.mean():+.2f}%' if len(losses) else 'N/A')
+        m[3].metric('Median trade',f'{net.median():+.2f}%')
+        m[4].metric('Longest losing streak',str(longest))
+        st.caption(f'Positive trades: {len(wins)} | Losing or flat trades: {len(net)-len(wins)} | '
+                   f'Average trade: {net.mean():+.2f}% | Trades evaluated: {len(net)}')
+        if stats['Total return %']<=0:
+            st.warning('This configuration lost money after estimated costs. A higher win rate alone does not make it viable.')
+        elif stats['Maximum drawdown %'] < -10:
+            st.info('This configuration was profitable in this sample, but historical drawdown exceeded the 10% research target.')
+        else:
+            st.success('This configuration met the positive-return and under-10%-drawdown research targets on this sample. This is not evidence of future performance.')
+    else:
+        st.info('No closed trades to evaluate for consistency.')
+    st.caption('These results reuse the same historical test data. Repeatedly changing filters against it creates overfitting; '
+               'confirm promising rules on a fresh later period and compare with a market benchmark before using real money.')
     st.line_chart(result['equity'].set_index('Date')['Equity AUD'])
     # Optional price-only ASX ETF reference from existing cache. Never fetch future prices.
     bench=load_historical_prices('STW')
