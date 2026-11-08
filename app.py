@@ -1969,37 +1969,49 @@ elif page=="Phase 4 Backtest":
     con.close()
     cached_in_universe=len(set(backtest_codes)&cached_codes)
     st.caption(f"This run has attempted {done:,}/{len(backtest_codes):,} codes; {cached_in_universe:,} have cached history. The local cache contains {cached_rows:,} daily OHLCV records across {cached_tickers:,} tickers. Progress counts attempted codes, so check the unavailable-share list too. Data and progress are in SQLite; back it up before replacing the app.")
+    st.caption("Auto-continue processes one checkpointed batch at a time. Keep this browser tab open; if the Streamlit server sleeps or restarts, return here and resume. Progress is saved in the local SQLite database, which may be lost on cloud redeployment.")
+    if "p4_auto_enabled" not in st.session_state:
+        st.session_state["p4_auto_enabled"] = False
     col_auto,col_single,col_reset=st.columns(3)
-    run_all=col_auto.button("Run all remaining batches automatically",type="primary",key="p4_run_all",disabled=(done>=len(backtest_codes) or not backtest_codes))
-    run_batch=col_single.button(f"Run one batch ({min(batch_size,max(0,len(backtest_codes)-done))})",key="p4_run_batch",disabled=(done>=len(backtest_codes) or not backtest_codes))
-    reset_batch=col_reset.button("Restart this backtest run",key="p4_reset_batch",disabled=(done==0))
-    st.caption("The automatic run may take a long time. Progress and data are saved after each batch; if Streamlit interrupts it, return here and click the automatic button again to resume.")
+    if col_auto.button("Stop auto-continue" if st.session_state["p4_auto_enabled"] else "Start auto-continue", type="primary", key="p4_toggle_auto", disabled=(done>=len(backtest_codes) or not backtest_codes) and not st.session_state["p4_auto_enabled"]):
+        st.session_state["p4_auto_enabled"] = not st.session_state["p4_auto_enabled"]
+        st.rerun()
+    run_batch=col_single.button(f"Run one batch ({min(batch_size,max(0,len(backtest_codes)-done))})",key="p4_run_batch",disabled=(done>=len(backtest_codes) or not backtest_codes or st.session_state["p4_auto_enabled"]))
+    reset_batch=col_reset.button("Restart this backtest run",key="p4_reset_batch",disabled=(done==0 or st.session_state["p4_auto_enabled"]))
     if reset_batch:
         set_batch_job_index(job_key,backtest_codes,interval,0)
         st.rerun()
-    if run_all:
-        current=done
-        batch_total=int(np.ceil((len(backtest_codes)-current)/batch_size))
-        overall=st.progress(0,text=f"Starting {batch_total} remaining batches…")
-        failed_codes=[]; batch_number=0
-        while current<len(backtest_codes):
-            batch_number+=1
-            batch_codes=backtest_codes[current:min(current+batch_size,len(backtest_codes))]
-            failed_codes.extend(process_historical_batch(batch_codes,job_key,interval,batch_number,batch_total))
-            current=min(current+len(batch_codes),len(backtest_codes))
-            set_batch_job_index(job_key,backtest_codes,interval,current)
-            overall.progress(current/max(1,len(backtest_codes)),text=f"Completed {current:,} of {len(backtest_codes):,} shares")
-        overall.empty()
-        st.session_state["p4_backtest_threshold"]=signal_threshold
-        st.success(f"Finished the full run. {len(failed_codes)} ticker(s) had unavailable or insufficient history; see the failed-share list below.")
-        st.rerun()
-    elif run_batch:
+    if run_batch:
         batch_codes=backtest_codes[done:min(done+batch_size,len(backtest_codes))]
         process_historical_batch(batch_codes,job_key,interval)
-        next_index=min(done+len(batch_codes),len(backtest_codes))
-        set_batch_job_index(job_key,backtest_codes,interval,next_index)
-        st.session_state["p4_backtest_threshold"]=signal_threshold
+        set_batch_job_index(job_key,backtest_codes,interval,min(done+len(batch_codes),len(backtest_codes)))
         st.rerun()
+
+    @st.fragment(run_every="10s")
+    def p4_auto_worker():
+        if not st.session_state.get("p4_auto_enabled"):
+            return
+        # Read the durable checkpoint on every tick instead of trusting a stale page variable.
+        con=db_connect()
+        record=con.execute("SELECT next_index FROM historical_batch_jobs WHERE job_key=?",(job_key,)).fetchone()
+        con.close()
+        current=min(int(record[0]) if record else 0,len(backtest_codes))
+        if current>=len(backtest_codes):
+            st.session_state["p4_auto_enabled"]=False
+            st.success("All shares attempted. Auto-continue finished.")
+            return
+        chunk=backtest_codes[current:min(current+batch_size,len(backtest_codes))]
+        st.info(f"Auto-continue: processing shares {current+1:,}–{current+len(chunk):,} of {len(backtest_codes):,}.")
+        try:
+            process_historical_batch(chunk,job_key,interval)
+        except Exception as exc:
+            # Preserve checkpoint and retry the same batch at the next interval.
+            st.error(f"Batch interrupted ({type(exc).__name__}: {exc}). Will retry on the next refresh.")
+            return
+        set_batch_job_index(job_key,backtest_codes,interval,current+len(chunk))
+        st.success(f"Saved checkpoint: {current+len(chunk):,}/{len(backtest_codes):,} shares. Next batch will start automatically.")
+
+    p4_auto_worker()
     bt=load_historical_learning(backtest_codes)
     if not bt.empty:
         cutoff=signal_threshold
