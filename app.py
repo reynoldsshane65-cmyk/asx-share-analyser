@@ -422,7 +422,7 @@ def run_scan(tickers, period):
                 "Return 3M %": np.nan, "Return 6M %": np.nan,
                 "Return 12M %": np.nan, "50D Average": np.nan, "Price vs 50D %": np.nan, "20D High": np.nan, "Distance from 20D High %": np.nan,
                 "200D Average": np.nan, "Above 200D %": np.nan,
-                "Volume Change %": np.nan, "Market Cap": np.nan,
+                "Volume Change %": np.nan, "20D dollar volume AUD": np.nan, "Market Cap": np.nan,
                 "P/E": np.nan, "Revenue Growth %": np.nan,
                 "Profit Margin %": np.nan, "VPA Score": np.nan, "Accumulation Score": np.nan, "Distribution Risk": np.nan, "20D Distribution Risk": np.nan, "Effort Result Score": np.nan, "VPA Signal": "No price data", "VPA Notes": "", "Fundamentals Status": "Not fetched (no prices)",
                 "Data Date": "", "Scan Status": status
@@ -462,6 +462,7 @@ def run_scan(tickers, period):
             "200D Average": num(ma200),
             "Above 200D %": (close.iloc[-1] / ma200 - 1) * 100 if pd.notna(ma200) and ma200 else np.nan,
             "Volume Change %": (v20 / vprev - 1) * 100 if v20 is not None and vprev not in (None, 0) else np.nan,
+            "20D dollar volume AUD": float((h["Close"].tail(20)*h["Volume"].tail(20)).mean()) if "Volume" in h and len(h)>=20 else np.nan,
             "Market Cap": market_cap, "P/E": pe, "Revenue Growth %": revenue_growth,
             "Profit Margin %": profit_margin, **calculate_vpa(h), **phase4_technical_inputs(h), "Fundamentals Status": fundamentals_status,
             "Data Date": close.index[-1].strftime("%Y-%m-%d"),
@@ -2186,8 +2187,109 @@ def render_opportunities(scan):
     st.download_button("Download shortlist CSV",top.to_csv(index=False).encode(),file_name="asx_opportunity_shortlist.csv",mime="text/csv",key="opportunities_download")
     st.caption("Historical figures reflect setup-level outcomes, not ticker-specific forecasts. Check ASX announcements, spreads, liquidity and potential losses before making any decision.")
 
+# ---------------- Independent research strategy screens ----------------
+def strategy_mask(frame, kind, liquidity, volatility, vpa_min, accum_min, dist_max, momentum_min):
+    def n(key):
+        if key in frame.columns:
+            return pd.to_numeric(frame[key], errors="coerce")
+        return pd.Series(np.nan, index=frame.index)
+    # Historical learning records do not contain daily dollar volume. Require a
+    # measured liquidity field for live candidates; leave it untested in history.
+    mask = n("Price").gt(0) if "Price" in frame else pd.Series(True, index=frame.index)
+    mask &= n("20D volatility %").le(volatility)
+    mask &= n("VPA Score").ge(vpa_min) & n("Accumulation Score").ge(accum_min)
+    mask &= n("Distribution Risk").le(dist_max)
+    if kind == "consistent":
+        mask &= n("Price vs 50D %").gt(0) & n("Return 1M %").gt(0)
+        mask &= n("Return 1W %").ge(-3) & n("Return 1W %").le(12)
+    else:
+        mask &= n("Return 1W %").ge(momentum_min)
+        mask &= n("Distance from 20D High %").ge(-5)
+        mask &= n("Volume Change %").ge(20)
+    if "20D dollar volume AUD" in frame.columns:
+        mask &= n("20D dollar volume AUD").ge(liquidity)
+    return mask.fillna(False)
+
+
+def render_strategy_screen(scan, kind):
+    consistent = kind == "consistent"
+    name = "Consistent Gains" if consistent else "Breakout Opportunities"
+    st.header(("🛡️ " if consistent else "🚀 ") + name)
+    st.write("Research screen for steadier trends and controlled risk." if consistent else
+             "Research screen for stronger momentum, volume expansion and potential larger moves.")
+    st.caption("These are separate, adjustable research screens, not predictions or guaranteed gains. Neither strategy places trades.")
+    with st.expander("Strategy settings", expanded=True):
+        a,b,c=st.columns(3)
+        prefix="cg" if consistent else "bo"
+        liquidity=a.select_slider("Minimum 20-day average daily traded value (AUD)",
+            options=[0,10000,20000,50000,100000,250000,500000,1000000],
+            value=100000 if consistent else 20000,key=prefix+"_liq")
+        volatility=b.slider("Maximum 20-day daily volatility (%)",1.0,20.0,5.0 if consistent else 10.0,0.5,key=prefix+"_vol")
+        vpa_min=c.slider("Minimum VPA score",0,100,60 if consistent else 65,key=prefix+"_vpa")
+        accum_min=a.slider("Minimum accumulation score",0,100,55 if consistent else 60,key=prefix+"_acc")
+        dist_max=b.slider("Maximum distribution risk",0,100,25 if consistent else 40,key=prefix+"_dist")
+        momentum_min=c.slider("Minimum 1-week gain (%)",0.0,30.0,3.0,0.5,key=prefix+"_momentum") if not consistent else 0.0
+    if scan is None or scan.empty:
+        st.info("Run the Automatic Share Scanner first. These pages use its latest completed scan; they do not start another download.")
+    else:
+        data=scan.copy()
+        # Scanner does not store dollar turnover directly. Derive an approximate
+        # average from its recent price and its historic 20-day volume baseline
+        # when possible; avoid silently treating Volume Change % as liquidity.
+        if "20D dollar volume AUD" not in data.columns:
+            data["20D dollar volume AUD"]=np.nan
+        eligible=strategy_mask(data,kind,liquidity,volatility,vpa_min,accum_min,dist_max,momentum_min)
+        result=data.loc[eligible].copy()
+        st.metric("Shares matching all selected conditions",len(result))
+        if data["20D dollar volume AUD"].isna().all():
+            st.warning("The existing scanner does not save 20-day average dollar turnover. The liquidity condition cannot yet be verified from its results, so no shares can qualify safely. A future scan must capture that metric; existing history remains unchanged.")
+        if not result.empty:
+            def numeric(k):
+                return pd.to_numeric(result[k],errors="coerce").fillna(50).clip(0,100) if k in result else pd.Series(50.0,index=result.index)
+            ems=numeric("Early-Mover Score"); vpa=numeric("VPA Score"); acc=numeric("Accumulation Score"); risk=numeric("Distribution Risk")
+            if consistent:
+                result["Strategy ranking"]=(.25*ems+.25*vpa+.20*acc+.30*(100-risk)).round(1)
+            else:
+                result["Strategy ranking"]=(.35*ems+.30*vpa+.25*acc+.10*(100-risk)).round(1)
+            result=result.sort_values("Strategy ranking",ascending=False)
+            cols=[c for c in ["Ticker","Company","Price","Strategy ranking","Early-Mover Score","VPA Score","Accumulation Score","Distribution Risk","20D volatility %","20D dollar volume AUD","Return 1W %","Return 1M %","Price vs 50D %","Volume Change %","Data Date"] if c in result]
+            st.dataframe(result[cols].head(100),hide_index=True,use_container_width=True)
+            st.download_button("Download strategy shortlist CSV",result[cols].to_csv(index=False).encode(),file_name=prefix+"_shortlist.csv",mime="text/csv",key=prefix+"_download")
+        elif not data["20D dollar volume AUD"].isna().all():
+            st.info("No shares currently meet all conditions. You can relax the sliders or run a newer scan.")
+    with st.expander("Historical performance check (independent for each strategy)"):
+        st.caption("Uses previously stored monthly historical examples. Tests the selected technical rules on later dates, separated from the earlier sample by 45 calendar days. Historical records do not include the live liquidity measure; liquidity is NOT evaluated here. These are forward 20-session returns, not simulated portfolio profits or drawdowns.")
+        if st.button("Evaluate historical 20-day outcomes",key=("cg" if consistent else "bo")+"_test"):
+            con=db_connect()
+            try:
+                raw=pd.read_sql_query("SELECT signal_date,features_json,return_20d FROM historical_learning_monthly WHERE return_20d IS NOT NULL",con)
+            finally:
+                con.close()
+            records=[]
+            for rec in raw.itertuples(index=False):
+                try: features=json.loads(rec.features_json or "{}")
+                except (ValueError,TypeError): continue
+                records.append({**features,"Signal date":rec.signal_date,"Return 20d %":rec.return_20d})
+            hist=pd.DataFrame(records)
+            if hist.empty or len(hist)<120:
+                st.warning("Not enough historical monthly observations yet (at least 120 needed).")
+            else:
+                hist["Signal date"]=pd.to_datetime(hist["Signal date"],errors="coerce")
+                hist["Return 20d %"]=pd.to_numeric(hist["Return 20d %"],errors="coerce")
+                hist=hist.dropna(subset=["Signal date","Return 20d %"]).sort_values("Signal date")
+                split=hist["Signal date"].iloc[int(len(hist)*.7)]
+                later=hist.loc[hist["Signal date"]>=split]
+                chosen=later.loc[strategy_mask(later,kind,liquidity,volatility,vpa_min,accum_min,dist_max,momentum_min)]
+                st.write(f"Later sample: {len(later):,} observations; matched: {len(chosen):,}. Historical liquidity not checked.")
+                if len(chosen)<20:
+                    st.warning("Fewer than 20 matched later observations; evidence is too limited for a useful comparison.")
+                else:
+                    for label,values in [(name,chosen["Return 20d %"]),("All later signals",later["Return 20d %"])]:
+                        st.write(f"**{label}:** {len(values):,} observations · {(values>0).mean()*100:.1f}% positive · {values.mean():+.2f}% average 20-session return · {values.median():+.2f}% median")
+                    st.caption("Thresholds were selected interactively, so this is exploratory analysis rather than a fresh untouched validation. Returns exclude fees and may include overlapping signals.")
+
 with st.sidebar:
-    page=st.radio("Page",["Today’s Opportunities","Single-Share Analysis","Automatic Share Scanner","Early-Mover Tracker","VPA Scanner","Prediction Lab","Phase 4 Backtest","Historical Signal Explorer","Sector Performance","Sector Prediction Accuracy","Lower-Risk Investing","Value Investing","Momentum Trading","High-Growth Shares","Long-Term Investing","Portfolio Planner"])
+    page=st.radio("Page",["Today’s Opportunities","Consistent Gains","Breakout Opportunities","Single-Share Analysis","Automatic Share Scanner","Early-Mover Tracker","VPA Scanner","Prediction Lab","Phase 4 Backtest","Historical Signal Explorer","Sector Performance","Sector Prediction Accuracy","Lower-Risk Investing","Value Investing","Momentum Trading","High-Growth Shares","Long-Term Investing","Portfolio Planner"])
     st.divider()
     ticker_text=st.text_area("ASX tickers (commas or new lines)",", ".join(MASTER_TICKERS),height=160,
         help="Defaults to the bundled ASX company list. Edit or paste your own tickers if needed.")
@@ -2867,6 +2969,10 @@ elif page=="Sector Performance":
 elif page=="Sector Prediction Accuracy":
     sector_accuracy_page()
 
+elif page=="Consistent Gains":
+    render_strategy_screen(scan,"consistent")
+elif page=="Breakout Opportunities":
+    render_strategy_screen(scan,"breakout")
 elif page=="Lower-Risk Investing":
     st.header(page); show_scan("Lower-Risk Score","A relative screen for shares above their 200-day average and without a severe monthly decline. These are not guaranteed to be safe.")
 elif page=="Value Investing":
