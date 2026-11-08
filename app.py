@@ -1225,7 +1225,7 @@ def simulate_historical_portfolio(signals, rule, hold_days, start_date, capital=
     data=data.loc[mask].dropna(subset=['Signal date','Ticker']).copy()
     if data.empty: return None,'No signals qualified in the later test period.'
     price_map={}; candidates=[]
-    skipped={'missing prices':0,'liquidity':0,'price':0,'no next open':0}
+    skipped={'missing prices':0,'liquidity':0,'price':0,'no next open':0,'volatility filter':0,'trend filter':0}
     for ticker,group in data.groupby('Ticker'):
         bars=load_historical_prices(str(ticker))
         if bars.empty: skipped['missing prices']+=len(group); continue
@@ -1336,8 +1336,75 @@ def simulate_historical_portfolio(signals, rule, hold_days, start_date, capital=
            'Annualised return %':((end_equity/capital)**(365.25/days)-1)*100 if end_equity>0 else -100,
            'Maximum drawdown %':float(eq['Drawdown %'].min()),
            'Closed trades':len(trades),'Win rate %':float((trades['Net P&L AUD']>0).mean()*100) if len(trades) else np.nan,
-           'Open positions at end':len(positions),'Candidate signals':len(candidates)}
+           'Open positions at end':len(positions),'Candidate signals':len(candidates),'Eligible tickers':len(set(x['ticker'] for x in candidates))}
     return {'equity':eq,'trades':trades,'stats':stats,'skipped':skipped,'rejected':rejected},None
+
+
+def render_walk_forward_testing(bt, rule, hold, saved, capital, positions, allocation, liquidity, participation):
+    """Rolling, chronological parameter selection; only earlier windows choose each fold's rule."""
+    st.markdown('### Walk-forward strategy testing')
+    st.caption('Each fold selects a volatility/trend combination using an earlier validation window, then evaluates that selection once on the next window. A 45-calendar-day gap separates windows. The underlying score rule and holding period were selected elsewhere and are NOT independently validated by this test.')
+    nfolds=st.selectbox('Number of walk-forward tests', [3,4],key='wf_nfolds')
+    min_count=st.number_input('Minimum validation closed trades per fold',min_value=5,max_value=100,value=15,step=5,key='wf_min_count')
+    dates=pd.to_datetime(bt['Signal date'],errors='coerce').dropna().dt.normalize().sort_values().unique()
+    signature=(len(bt),str(pd.to_datetime(bt['Signal date']).max()),tuple(rule),hold,saved['costs'],saved['price'],capital,positions,allocation,liquidity,participation,nfolds,min_count)
+    if st.button('Run walk-forward tests',key='wf_run'):
+        if len(dates)<160:
+            st.session_state['wf_result']={'signature':signature,'error':'Need at least 160 distinct historical signal dates.'}
+        else:
+            # Expanding validation followed by a strictly later test. Avoid adjacent outcome overlap.
+            boundaries=np.linspace(int(len(dates)*0.38),int(len(dates)*0.88),nfolds+1,dtype=int)
+            configs=[(v,t) for v in (0,2,3,4,5,7,10) for t in (False,True)]
+            rows=[]; diag=[]; progress=st.progress(0,text='Testing chronological folds...')
+            total=nfolds*(len(configs)+1); done=0
+            signal_dates=pd.to_datetime(bt['Signal date'],errors='coerce')
+            for f in range(nfolds):
+                val_start=pd.Timestamp(dates[0]); val_end=pd.Timestamp(dates[boundaries[f]])-pd.Timedelta(days=45)
+                test_start=pd.Timestamp(dates[boundaries[f]]); test_end=pd.Timestamp(dates[boundaries[f+1]])
+                validation=bt[(signal_dates>=val_start)&(signal_dates<=val_end)]
+                candidates=[]
+                for vol,trend in configs:
+                    r,e=simulate_historical_portfolio(validation,rule,hold,val_start,capital,allocation,positions,saved['costs'],saved['price'],liquidity,participation,0,0,0,'Score',vol,trend)
+                    if r is not None and e is None:
+                        a=r['stats']; n=int(a['Closed trades'])
+                        if n>=min_count:
+                            pnl=pd.to_numeric(r['trades']['Net P&L AUD'],errors='coerce')
+                            loss=-float(pnl[pnl<0].sum()); profit=float(pnl[pnl>0].sum())
+                            pf=profit/loss if loss>0 else (10.0 if profit>0 else 0.0)
+                            score=float(a['Total return %'])+1.5*float(a['Maximum drawdown %'])
+                            candidates.append((score,pf,vol,trend,n))
+                        diag.append({'Fold':f+1,'Volatility max %':vol,'Trend ON':trend,'Validation trades':n,'Trend rejected':r['skipped'].get('trend filter',0),'Volatility rejected':r['skipped'].get('volatility filter',0)})
+                    done+=1; progress.progress(done/total)
+                if candidates:
+                    _,_,vol,trend,n=max(candidates,key=lambda x:(x[0],x[1]))
+                    test=bt[(signal_dates>=test_start)&(signal_dates<test_end)]
+                    r,e=simulate_historical_portfolio(test,rule,hold,test_start,capital,allocation,positions,saved['costs'],saved['price'],liquidity,participation,0,0,0,'Score',vol,trend)
+                    if r is not None and e is None:
+                        a=r['stats']; rows.append({'Fold':f+1,'Validation through':str(val_end.date()),'Test start':str(test_start.date()),'Test end':str(test_end.date()),'Chosen volatility %':vol,'Trend ON':trend,'Validation trades':n,'Test trades':a['Closed trades'],'Test return %':a['Total return %'],'Test max drawdown %':a['Maximum drawdown %'],'Test win rate %':a['Win rate %']})
+                    else:
+                        rows.append({'Fold':f+1,'Test start':str(test_start.date()),'Error':str(e)})
+                else:
+                    rows.append({'Fold':f+1,'Test start':str(test_start.date()),'Error':'No configuration met minimum trades'})
+                done+=1; progress.progress(done/total)
+            progress.empty()
+            st.session_state['wf_result']={'signature':signature,'rows':pd.DataFrame(rows),'diagnostics':pd.DataFrame(diag)}
+    record=st.session_state.get('wf_result')
+    if not record:return
+    if record['signature']!=signature:
+        st.info('Settings changed. Rerun walk-forward tests.');return
+    if record.get('error'):
+        st.warning(record['error']);return
+    frame=record['rows']
+    st.dataframe(frame.round(2),hide_index=True,use_container_width=True)
+    st.download_button('Download walk-forward results CSV',frame.to_csv(index=False).encode(),file_name='asx_walk_forward_results.csv',mime='text/csv',key='wf_csv')
+    with st.expander('Filter rejection diagnostics by fold'):
+        d=record['diagnostics'];st.dataframe(d,hide_index=True,use_container_width=True)
+        st.download_button('Download filter diagnostics CSV',d.to_csv(index=False).encode(),file_name='asx_filter_diagnostics.csv',mime='text/csv',key='wf_diag_csv')
+        if len(d):
+            paired=d.pivot_table(index=['Fold','Volatility max %'],columns='Trend ON',values='Trend rejected',aggfunc='first')
+            if True in paired.columns and (paired[True].fillna(0)==0).all():
+                st.warning('Trend ON rejected zero signals in every tested validation fold. Verify price-history availability, signal timestamps and moving-average calculation before relying on this filter.')
+    st.warning('Research only: folds share a historical dataset, may contain repeated tickers, and the score rule was previously selected. No guarantee of live performance. Validate on future paper trades and account for delistings, corporate actions and execution.')
 
 
 def render_automatic_strategy_testing(bt):
@@ -1440,6 +1507,11 @@ def render_automatic_strategy_testing(bt):
     metrics[2].metric('Holdout win rate',f"{stats['Win rate %']:.1f}%")
     metrics[3].metric('Holdout closed trades',str(stats['Closed trades']))
     st.line_chart(result['equity'].set_index('Date')['Equity AUD'])
+    st.markdown('**Entry filter diagnostics**')
+    st.caption('Counts are rejected signal rows, before portfolio capacity constraints. A zero trend rejection with trend ON may indicate the filter is ineffective or the eligible universe is already entirely above its moving average.')
+    st.dataframe(pd.DataFrame([{'Reason':k,'Rejected signals':v} for k,v in result.get('skipped',{}).items()]),hide_index=True,use_container_width=True)
+    st.caption(f"Eligible candidates: {stats['Candidate signals']}; eligible tickers: {stats.get('Eligible tickers', 'unknown')}.")
+    render_walk_forward_testing(bt, rule, hold, saved, capital, positions, allocation, liquidity, participation)
     st.warning('The optimiser rule was already selected using this historical dataset, so this is not a fully independent test of the entire strategy. Repeated runs and parameter changes on the same holdout introduce overfitting. Signals are sampled; delisted shares, execution uncertainty and corporate-action data can affect results. Forward paper testing is needed.')
 
 
