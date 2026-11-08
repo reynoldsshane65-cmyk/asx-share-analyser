@@ -1204,11 +1204,14 @@ def render_strategy_optimiser(bt):
 def simulate_historical_portfolio(signals, rule, hold_days, start_date, capital=10000.0,
                                   position_pct=10, max_positions=5, costs_pct=0.8,
                                   min_price=0.10, min_dollar_volume=20000.0,
-                                  participation_pct=2.0):
-    """Chronological paper portfolio using cached daily bars, never future signal returns.
+                                  participation_pct=2.0, stop_pct=0.0,
+                                  target_pct=0.0, trailing_pct=0.0,
+                                  rank_method="Score"):
+    """Chronological daily-bar research simulation. Stops are conservative on ambiguous bars.
 
-    Enter at next available session OPEN, exit at CLOSE after hold_days sessions.
-    Signals are generated at signal-day close; use only prior 20 bars for liquidity.
+    Signals known at close -> next available opening entry; prior 20-session liquidity.
+    Exit stop/target based on daily OHLC, open gaps filled at opening price.
+    Trailing peak updated AFTER evaluating each session to avoid lookahead.
     """
     data=signals.copy()
     data['Signal date']=pd.to_datetime(data['Signal date'],errors='coerce').dt.normalize()
@@ -1219,76 +1222,101 @@ def simulate_historical_portfolio(signals, rule, hold_days, start_date, capital=
     if vpa is not None: mask &= data['VPA Score']>=vpa
     if accum is not None: mask &= data['Accumulation Score']>=accum
     if safety is not None: mask &= data['Distribution Safety']>=safety
-    data=data.loc[mask].dropna(subset=['Signal date','Ticker']).sort_values(['Signal date','Score'],ascending=[True,False])
+    data=data.loc[mask].dropna(subset=['Signal date','Ticker']).copy()
     if data.empty: return None,'No signals qualified in the later test period.'
-    price_map={}
-    candidates=[]
+    price_map={}; candidates=[]
     skipped={'missing prices':0,'liquidity':0,'price':0,'no next open':0}
-    for ticker, group in data.groupby('Ticker'):
+    for ticker,group in data.groupby('Ticker'):
         bars=load_historical_prices(str(ticker))
         if bars.empty: skipped['missing prices']+=len(group); continue
         bars=bars[~bars.index.duplicated(keep='last')].sort_index().copy()
-        for col in ('Open','Close','Volume'):
+        for col in ('Open','High','Low','Close','Volume'):
             bars[col]=pd.to_numeric(bars[col],errors='coerce')
-        bars['Prior dollar volume']= (bars['Close']*bars['Volume']).shift(1).rolling(20,min_periods=20).mean()
+        bars['Prior dollar volume']=(bars['Close']*bars['Volume']).shift(1).rolling(20,min_periods=20).mean()
         price_map[ticker]=bars
         for _,row in group.iterrows():
-            day=row['Signal date']
-            ix=int(bars.index.searchsorted(day,side='right'))
+            ix=int(bars.index.searchsorted(row['Signal date'],side='right'))
             if ix>=len(bars): skipped['no next open']+=1; continue
             entry=bars.iloc[ix]
             if not np.isfinite(entry['Open']) or entry['Open']<=0: skipped['no next open']+=1; continue
             if entry['Open']<min_price: skipped['price']+=1; continue
             adv=entry['Prior dollar volume']
             if not np.isfinite(adv) or adv<min_dollar_volume: skipped['liquidity']+=1; continue
-            exit_ix=ix+int(hold_days)-1
-            if exit_ix>=len(bars): skipped['missing prices']+=1; continue
-            exit_bar=bars.iloc[exit_ix]
-            if not np.isfinite(exit_bar['Close']) or exit_bar['Close']<=0: skipped['missing prices']+=1; continue
-            candidates.append({'ticker':ticker,'entry_date':bars.index[ix], 'exit_date':bars.index[exit_ix],
-                               'entry_price':float(entry['Open']),'exit_price':float(exit_bar['Close']),
-                               'adv':float(adv),'score':float(row['Score'])})
-    if not candidates: return None,'No trades passed the cached-price and liquidity checks. Lower liquidity threshold or expand history.'
-    candidates.sort(key=lambda x:(x['entry_date'],-x['score'],x['ticker']))
+            end_ix=ix+int(hold_days)-1
+            if end_ix>=len(bars): skipped['missing prices']+=1; continue
+            window=bars.iloc[ix:end_ix+1]
+            if window[['Open','High','Low','Close']].isna().any().any() or (window[['Open','High','Low','Close']]<=0).any().any():
+                skipped['missing prices']+=1; continue
+            rank=float(row['Score'])
+            if rank_method=='Score + VPA + Accumulation':
+                rank += 0.2*(float(row['VPA Score']) if pd.notna(row['VPA Score']) else 0)
+                rank += 0.2*(float(row['Accumulation Score']) if pd.notna(row['Accumulation Score']) else 0)
+            candidates.append({'ticker':ticker,'entry_date':bars.index[ix],
+                               'deadline':bars.index[end_ix], 'entry_price':float(entry['Open']),
+                               'adv':float(adv),'score':float(row['Score']),'rank':rank})
+    if not candidates: return None,'No trades passed cached-price and liquidity checks.'
+    candidates.sort(key=lambda x:(x['entry_date'],-x['rank'],x['ticker']))
+    end_date=max(x['deadline'] for x in candidates)
     dates=sorted(set().union(*(set(b.index[(b.index>=pd.Timestamp(start_date)) &
-                                   (b.index<=max(x['exit_date'] for x in candidates))]) for b in price_map.values())))
-    if not dates: return None,'No daily price history available for equity calculation.'
+                                   (b.index<=end_date)]) for b in price_map.values())))
     by_date={}
     for x in candidates: by_date.setdefault(x['entry_date'],[]).append(x)
-    cash=float(capital); positions={}; ledger=[]; equity_rows=[]
+    cash=float(capital); positions={}; ledger=[]; equity_rows=[]; last_prices={}
     half_cost=costs_pct/200.0
     rejected={'full portfolio':0,'already held':0,'cash or participation':0}
-    last_prices={}
     for day in dates:
-        # Exit at session close. Entries use session open and are evaluated before close exits.
+        # Open new trades at session open. Signals from previous close only.
         for x in by_date.get(day,[]):
             t=x['ticker']
             if t in positions: rejected['already held']+=1; continue
             if len(positions)>=max_positions: rejected['full portfolio']+=1; continue
-            # Size against portfolio value at last known closes, not future closes.
             marked=cash+sum(pos['shares']*last_prices.get(tk,pos['entry_price']) for tk,pos in positions.items())
-            budget=min(marked*position_pct/100.0, x['adv']*participation_pct/100.0, cash)
+            budget=min(marked*position_pct/100.0,x['adv']*participation_pct/100.0,cash)
             shares=int(budget/(x['entry_price']*(1+half_cost)))
             if shares<1: rejected['cash or participation']+=1; continue
             spend=shares*x['entry_price']*(1+half_cost)
             cash-=spend
-            positions[t]={**x,'shares':shares,'spend':spend}
+            positions[t]={**x,'shares':shares,'spend':spend,'peak':x['entry_price']}
+        # Evaluate exits using today's OHLC; stop gets priority if both hit.
         for t,pos in list(positions.items()):
-            if pos['exit_date']<=day:
-                proceeds=pos['shares']*pos['exit_price']*(1-half_cost)
+            bars=price_map[t]
+            if day not in bars.index: continue
+            bar=bars.loc[day]
+            op,hi,lo,cl=(float(bar[k]) for k in ('Open','High','Low','Close'))
+            if not all(np.isfinite(z) and z>0 for z in (op,hi,lo,cl)): continue
+            fixed_stop=pos['entry_price']*(1-stop_pct/100) if stop_pct>0 else -np.inf
+            trailing_stop=pos['peak']*(1-trailing_pct/100) if trailing_pct>0 else -np.inf
+            stop=max(fixed_stop,trailing_stop)
+            target=pos['entry_price']*(1+target_pct/100) if target_pct>0 else np.inf
+            exit_price=None; reason=None
+            if op<=stop:
+                exit_price=op; reason='Stop gap at open'
+            elif op>=target:
+                exit_price=op; reason='Target gap at open'
+            elif lo<=stop:
+                exit_price=stop; reason='Stop (conservative if both hit)'
+            elif hi>=target:
+                exit_price=target; reason='Take profit'
+            elif day>=pos['deadline']:
+                exit_price=cl; reason='Holding period'
+            if exit_price is not None:
+                proceeds=pos['shares']*exit_price*(1-half_cost)
                 cash+=proceeds
                 ledger.append({'Ticker':t,'Entry date':str(pos['entry_date'].date()),
                                'Exit date':str(day.date()),'Shares':pos['shares'],
-                               'Entry open':pos['entry_price'],'Exit close':pos['exit_price'],
-                               'Cost AUD':round(pos['spend'],2),'Proceeds AUD':round(proceeds,2),
-                               'Net P&L AUD':round(proceeds-pos['spend'],2),
+                               'Entry open':pos['entry_price'],'Exit price':exit_price,
+                               'Exit reason':reason,'Cost AUD':round(pos['spend'],2),
+                               'Proceeds AUD':round(proceeds,2),'Net P&L AUD':round(proceeds-pos['spend'],2),
                                'Net return %':round((proceeds/pos['spend']-1)*100,3),
                                'Prior 20d avg dollar volume':round(pos['adv'],2)})
                 del positions[t]
+            else:
+                # Peak updated after intraday stop evaluation; no intraday sequencing assumed.
+                pos['peak']=max(pos['peak'],hi)
         for t in positions:
-            b=price_map[t]
-            if day in b.index and np.isfinite(b.loc[day,'Close']) and b.loc[day,'Close']>0:
-                last_prices[t]=float(b.loc[day,'Close'])
+            bars=price_map[t]
+            if day in bars.index and pd.notna(bars.loc[day,'Close']):
+                last_prices[t]=float(bars.loc[day,'Close'])
         equity=cash+sum(pos['shares']*last_prices.get(t,pos['entry_price']) for t,pos in positions.items())
         equity_rows.append({'Date':day,'Equity AUD':equity,'Cash AUD':cash,'Open positions':len(positions)})
     eq=pd.DataFrame(equity_rows)
@@ -1337,14 +1365,27 @@ def render_portfolio_simulator(bt):
     with c:
         participation=st.slider('Maximum position as % of average daily dollar volume',0.1,10.0,2.0,0.1,key='sim_participation')
         st.caption(f"Round-trip costs {saved['costs']:.1f}%; minimum share price ${saved['price']:.2f} (from optimiser).")
+    st.markdown('**Experimental exits and entry ranking**')
+    d,e,f=st.columns(3)
+    with d:
+        stop=st.selectbox('Stop-loss (%)',[0,5,8,10,15,20],index=0,key='sim_stop',format_func=lambda v:'Off' if v==0 else f'{v}%')
+    with e:
+        target=st.selectbox('Take-profit (%)',[0,10,15,20,30],index=0,key='sim_target',format_func=lambda v:'Off' if v==0 else f'{v}%')
+    with f:
+        trailing=st.selectbox('Trailing stop (%)',[0,5,8,10,15,20],index=0,key='sim_trailing',format_func=lambda v:'Off' if v==0 else f'{v}%')
+    ranking=st.selectbox('Choose candidates when positions are limited',
+                         ['Score','Score + VPA + Accumulation'],key='sim_ranking')
+    st.caption('Stops/targets use cached daily OHLC. Opening gaps fill at the open; if both intraday thresholds are touched, '
+               'the stop is assumed first. Trailing peaks update after each day, so same-day high-to-low ordering is not assumed. '
+               'These are approximate fills, not real orders.')
     st.warning('Research simulation only. Cached Yahoo prices may be adjusted or inconsistent across corporate actions; '
-               'liquidity uses historical daily volume rather than bid/ask depth. No stop-loss/take-profit execution, '
+               'liquidity uses historical daily volume rather than bid/ask depth. Stop/target fills are approximate, '
                'dividends, tax, benchmark, delisted-stock coverage, or guaranteed fills. Signals are sampled, not all daily opportunities.')
-    settings=(rank,capital,max_positions,allocation,liquidity,participation,saved['costs'],saved['price'],len(bt),opt['test_start'])
+    settings=(rank,capital,max_positions,allocation,liquidity,participation,saved['costs'],saved['price'],len(bt),opt['test_start'],stop,target,trailing,ranking)
     if st.button('Run trade-by-trade simulation',key='sim_run'):
         with st.spinner('Loading cached daily bars and simulating portfolio...'):
             result,error=simulate_historical_portfolio(bt,rule,int(r['Hold days']),opt['test_start'],capital,
-                            allocation,max_positions,saved['costs'],saved['price'],liquidity,participation)
+                            allocation,max_positions,saved['costs'],saved['price'],liquidity,participation,stop,target,trailing,ranking)
         st.session_state['sim_result']={'settings':settings,'result':result,'error':error}
     record=st.session_state.get('sim_result')
     if not record: return
@@ -1359,7 +1400,32 @@ def render_portfolio_simulator(bt):
         col.metric(key,fmt.format(stats[key]))
     st.caption(f"Win rate: {stats['Win rate %']:.1f}% | Annualised return: {stats['Annualised return %']:+.2f}% | "
                f"Candidates: {stats['Candidate signals']:,} | Open positions at end: {stats['Open positions at end']}")
+    if stop or target or trailing or ranking!='Score':
+        st.caption('Comparison with unchanged baseline using identical capital, costs, liquidity and position limits:')
+        if st.button('Compare with unchanged baseline',key='sim_compare_baseline'):
+            with st.spinner('Running baseline with no exits and score-only ranking...'):
+                baseline,base_err=simulate_historical_portfolio(bt,rule,int(r['Hold days']),opt['test_start'],capital,
+                    allocation,max_positions,saved['costs'],saved['price'],liquidity,participation)
+            if base_err: st.warning(base_err)
+            else:
+                st.dataframe(pd.DataFrame([
+                    {'Version':'Unchanged baseline',**{k:baseline['stats'][k] for k in ('Total return %','Maximum drawdown %','Closed trades','Win rate %')}},
+                    {'Version':'Experimental',**{k:stats[k] for k in ('Total return %','Maximum drawdown %','Closed trades','Win rate %')}}
+                ]),hide_index=True,use_container_width=True)
+                st.caption('Exploratory comparison on the same historical test period. Changing settings based on this test makes it no longer untouched.')
     st.line_chart(result['equity'].set_index('Date')['Equity AUD'])
+    # Optional price-only ASX ETF reference from existing cache. Never fetch future prices.
+    bench=load_historical_prices('STW')
+    if not bench.empty:
+        bench=bench.sort_index()
+        bench=bench[(bench.index>=result['equity']['Date'].min()) & (bench.index<=result['equity']['Date'].max())]
+        close=pd.to_numeric(bench['Close'],errors='coerce').dropna()
+        if len(close)>=30 and close.iloc[0]>0:
+            bench_end=capital*close.iloc[-1]/close.iloc[0]
+            st.caption(f'STW ETF cached close-price-only reference: ${bench_end:,.2f} from ${capital:,.0f} '
+                       f'({(bench_end/capital-1)*100:+.2f}%). Excludes dividends, fees and exact matching execution dates; not a total-return benchmark.')
+    else:
+        st.caption('Benchmark unavailable: no cached STW ETF daily history. No external benchmark data fetched.')
     st.write('**Closed trades**')
     st.dataframe(result['trades'],use_container_width=True,hide_index=True)
     st.download_button('Download simulated trades CSV',result['trades'].to_csv(index=False).encode(),
