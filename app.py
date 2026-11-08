@@ -1225,7 +1225,7 @@ def simulate_historical_portfolio(signals, rule, hold_days, start_date, capital=
     data=data.loc[mask].dropna(subset=['Signal date','Ticker']).copy()
     if data.empty: return None,'No signals qualified in the later test period.'
     price_map={}; candidates=[]
-    skipped={'missing prices':0,'liquidity':0,'price':0,'no next open':0,'volatility filter':0,'trend filter':0}
+    skipped={'missing prices':0,'liquidity':0,'price':0,'no next open':0,'volatility filter':0,'trend filter':0,'trend below MA':0,'trend missing MA':0,'trend eligible before volatility':0,'trend passes before volatility':0,'trend fails before volatility':0,'trend missing before volatility':0}
     for ticker,group in data.groupby('Ticker'):
         bars=load_historical_prices(str(ticker))
         if bars.empty: skipped['missing prices']+=len(group); continue
@@ -1245,10 +1245,26 @@ def simulate_historical_portfolio(signals, rule, hold_days, start_date, capital=
             if entry['Open']<min_price: skipped['price']+=1; continue
             adv=entry['Prior dollar volume']
             if not np.isfinite(adv) or adv<min_dollar_volume: skipped['liquidity']+=1; continue
+            # Independent trend diagnostics: measure trend BEFORE the volatility filter,
+            # while keeping the actual trading filter order unchanged.
+            prior_close = bars.iloc[ix-1]['Close'] if ix > 0 else np.nan
+            prior_ma = entry['Prior 50D MA']
+            skipped['trend eligible before volatility'] += 1
+            if not np.isfinite(prior_close) or not np.isfinite(prior_ma):
+                skipped['trend missing before volatility'] += 1
+            elif prior_close > prior_ma:
+                skipped['trend passes before volatility'] += 1
+            else:
+                skipped['trend fails before volatility'] += 1
             if max_daily_volatility>0 and (not np.isfinite(entry['Prior volatility %']) or entry['Prior volatility %']>max_daily_volatility):
                 skipped.setdefault('volatility filter',0); skipped['volatility filter']+=1; continue
             if require_uptrend and (not np.isfinite(entry['Prior 50D MA']) or not np.isfinite(bars.iloc[ix-1]['Close']) or bars.iloc[ix-1]['Close']<=entry['Prior 50D MA']):
-                skipped.setdefault('trend filter',0); skipped['trend filter']+=1; continue
+                skipped['trend filter'] += 1
+                if not np.isfinite(prior_close) or not np.isfinite(prior_ma):
+                    skipped['trend missing MA'] += 1
+                else:
+                    skipped['trend below MA'] += 1
+                continue
             end_ix=ix+int(hold_days)-1
             if end_ix>=len(bars): skipped['missing prices']+=1; continue
             window=bars.iloc[ix:end_ix+1]
@@ -1373,7 +1389,7 @@ def render_walk_forward_testing(bt, rule, hold, saved, capital, positions, alloc
                             pf=profit/loss if loss>0 else (10.0 if profit>0 else 0.0)
                             score=float(a['Total return %'])+1.5*float(a['Maximum drawdown %'])
                             candidates.append((score,pf,vol,trend,n))
-                        diag.append({'Fold':f+1,'Volatility max %':vol,'Trend ON':trend,'Validation trades':n,'Trend rejected':r['skipped'].get('trend filter',0),'Volatility rejected':r['skipped'].get('volatility filter',0)})
+                        diag.append({'Fold':f+1,'Volatility max %':vol,'Trend ON':trend,'Validation trades':n,'Trend rejected':r['skipped'].get('trend filter',0),'Volatility rejected':r['skipped'].get('volatility filter',0),'Trend checked before volatility':r['skipped'].get('trend eligible before volatility',0),'Above 50D MA':r['skipped'].get('trend passes before volatility',0),'At/below 50D MA':r['skipped'].get('trend fails before volatility',0),'Missing 50D MA':r['skipped'].get('trend missing before volatility',0),'Trend rejected below MA':r['skipped'].get('trend below MA',0),'Trend rejected missing MA':r['skipped'].get('trend missing MA',0)})
                     done+=1; progress.progress(done/total)
                 if candidates:
                     _,_,vol,trend,n=max(candidates,key=lambda x:(x[0],x[1]))
@@ -1401,6 +1417,7 @@ def render_walk_forward_testing(bt, rule, hold, saved, capital, positions, alloc
         d=record['diagnostics'];st.dataframe(d,hide_index=True,use_container_width=True)
         st.download_button('Download filter diagnostics CSV',d.to_csv(index=False).encode(),file_name='asx_filter_diagnostics.csv',mime='text/csv',key='wf_diag_csv')
         if len(d):
+            st.caption('Independent trend counts are measured after price/liquidity checks but BEFORE volatility rejection. They show whether the trend filter is redundant, missing data, or simply hidden by the volatility filter. These are candidate signals, not executed trades.')
             paired=d.pivot_table(index=['Fold','Volatility max %'],columns='Trend ON',values='Trend rejected',aggfunc='first')
             if True in paired.columns and (paired[True].fillna(0)==0).all():
                 st.warning('Trend ON rejected zero signals in every tested validation fold. Verify price-history availability, signal timestamps and moving-average calculation before relying on this filter.')
