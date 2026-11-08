@@ -2288,8 +2288,196 @@ def render_strategy_screen(scan, kind):
                         st.write(f"**{label}:** {len(values):,} observations · {(values>0).mean()*100:.1f}% positive · {values.mean():+.2f}% average 20-session return · {values.median():+.2f}% median")
                     st.caption("Thresholds were selected interactively, so this is exploratory analysis rather than a fresh untouched validation. Returns exclude fees and may include overlapping signals.")
 
+# ---------------- Historical two-strategy portfolio comparison ----------------
+def _comparison_candidates(years, max_tickers, signal_spacing=5):
+    """Build signals using only data known at each historical close."""
+    con=db_connect()
+    stats=con.execute("SELECT ticker,COUNT(*) AS n FROM historical_prices GROUP BY ticker HAVING COUNT(*)>=100 ORDER BY ticker").fetchall()
+    codes=[r[0] for r in stats]
+    if max_tickers: codes=codes[:max_tickers]
+    if not codes:
+        con.close(); return pd.DataFrame(),{},0
+    end=pd.Timestamp.today().normalize()
+    start=end-pd.DateOffset(years=years)
+    warmup=start-pd.Timedelta(days=420)
+    candidates=[]; histories={}
+    bar=st.progress(0,text="Reconstructing historical signals from cached prices…")
+    for j,ticker in enumerate(codes):
+        raw=pd.read_sql_query("SELECT price_date,open,high,low,close,volume FROM historical_prices WHERE ticker=? AND price_date>=? ORDER BY price_date",con,params=(ticker,warmup.strftime('%Y-%m-%d')))
+        if len(raw)<100: continue
+        raw['price_date']=pd.to_datetime(raw['price_date'],errors='coerce')
+        h=raw.set_index('price_date').rename(columns={'open':'Open','high':'High','low':'Low','close':'Close','volume':'Volume'}).sort_index()
+        for k in ('Open','High','Low','Close','Volume'): h[k]=pd.to_numeric(h[k],errors='coerce')
+        h=h.dropna(subset=['Close'])
+        if len(h)<100: continue
+        c=h['Close']; v=h['Volume'].fillna(0)
+        h['ma50']=c.rolling(50,min_periods=50).mean()
+        h['vol20']=c.pct_change().rolling(20,min_periods=20).std()*100
+        h['turnover20']=(c*v).rolling(20,min_periods=20).mean()
+        h['ret1w']=(c/c.shift(5)-1)*100
+        h['ret1m']=(c/c.shift(21)-1)*100
+        h['dist_high']=(c/c.rolling(20,min_periods=20).max()-1)*100
+        h['vol_change']=(v.rolling(20,min_periods=20).mean()/v.shift(20).rolling(20,min_periods=20).mean().replace(0,np.nan)-1)*100
+        histories[ticker]=h[['Open','High','Low','Close','Volume']]
+        # One candidate per five cached trading sessions, starting after warmup.
+        for i in range(100,len(h),signal_spacing):
+            date=h.index[i]
+            if date<start or date>end: continue
+            row=h.iloc[i]
+            if not np.isfinite(row['Close']) or row['Close']<0.05: continue
+            if not np.isfinite(row['vol20']) or not np.isfinite(row['turnover20']): continue
+            vol=float(row['vol20']); liq=float(row['turnover20']); w=float(row['ret1w']); m=float(row['ret1m'])
+            ma=float(row['ma50']); dist=float(row['dist_high']); change=float(row['vol_change'])
+            # Cheap prefilter avoids expensive VPA for clearly ineligible setups.
+            cg=liq>=100000 and vol<=5 and row['Close']>ma and m>0 and -3<=w<=12
+            bo=liq>=20000 and vol<=10 and w>=3 and dist>=-5 and change>=20
+            if not cg and not bo: continue
+            vpa=calculate_vpa(h.iloc[max(0,i-119):i+1][['Open','High','Low','Close','Volume']])
+            vp=num(vpa.get('VPA Score')); ac=num(vpa.get('Accumulation Score')); dr=num(vpa.get('Distribution Risk'))
+            if any(x is None for x in (vp,ac,dr)): continue
+            if cg and vp>=60 and ac>=55 and dr<=25:
+                rank=.25*min(100,max(0,50+w*3))+.25*vp+.20*ac+.30*(100-dr)
+                candidates.append((date,ticker,'Consistent Gains',rank,liq,vol))
+            if bo and vp>=65 and ac>=60 and dr<=40:
+                rank=.35*min(100,max(0,50+w*3))+.30*vp+.25*ac+.10*(100-dr)
+                candidates.append((date,ticker,'Breakout Opportunities',rank,liq,vol))
+        if j%10==0 or j==len(codes)-1: bar.progress((j+1)/len(codes),text=f"Reconstructing signals: {j+1:,}/{len(codes):,} shares")
+    con.close(); bar.empty()
+    return pd.DataFrame(candidates,columns=['date','ticker','strategy','score','liquidity','volatility']),histories,len(codes)
+
+
+def _comparison_simulate(signals, histories, start, end, capital, hold_days, brokerage, slip_pct, max_positions=5):
+    """Buy at next recorded open, mark daily at close, exit at stop/target/timeout."""
+    sessions=sorted({d for h in histories.values() for d in h.index if start<=d<=end})
+    if not sessions: return pd.DataFrame(),pd.DataFrame()
+    # Signals are generated after close. Orders execute at each ticker's next session open.
+    orders={}; by_date={}
+    for row in signals.itertuples(index=False):
+        h=histories[row.ticker]
+        idx=h.index.searchsorted(row.date,side='right')
+        if idx>=len(h): continue
+        entry_date=h.index[idx]
+        if entry_date>end: continue
+        orders.setdefault(entry_date,[]).append(row)
+    cash=float(capital); positions={}; trades=[]; curve=[]
+    for day in sessions:
+        # Exit orders on this day's OHLC, with stop-gap and conservative intraday stop handling.
+        for ticker,p in list(positions.items()):
+            h=histories[ticker]
+            if day not in h.index: continue
+            bar=h.loc[day]; op=num(bar['Open']); lo=num(bar['Low']); hi=num(bar['High']); cl=num(bar['Close'])
+            if cl is None or cl<=0: continue
+            p['days']+=1
+            stop=p['entry']*(.94 if p['strategy']=='Consistent Gains' else .90)
+            target=p['entry']*(1.12 if p['strategy']=='Consistent Gains' else 1.25)
+            reason=None; exit_price=cl
+            if op is not None and op>0 and op<=stop: reason='Stop gap'; exit_price=op
+            elif lo is not None and lo<=stop: reason='Stop'; exit_price=stop
+            elif hi is not None and hi>=target: reason='Target'; exit_price=target
+            elif p['days']>=hold_days: reason='Time exit'
+            elif day==sessions[-1]: reason='End of test'
+            if reason:
+                exit_price=max(0,exit_price*(1-slip_pct/100))
+                proceeds=p['shares']*exit_price-brokerage
+                cash+=proceeds
+                trades.append({'Ticker':ticker,'Entry date':p['date'].date().isoformat(),'Exit date':day.date().isoformat(),
+                    'Entry price':round(p['entry'],4),'Exit price':round(exit_price,4),'Net P/L (AUD)':round(proceeds-p['cost'],2),
+                    'Return %':round((proceeds/p['cost']-1)*100,2),'Exit reason':reason})
+                del positions[ticker]
+        # Only fill orders if the next session opens and cash is available.
+        picks=sorted(orders.get(day,[]),key=lambda r:(-r.score,r.ticker))
+        for s in picks:
+            if len(positions)>=max_positions: break
+            if s.ticker in positions: continue
+            h=histories[s.ticker]; bar=h.loc[day]
+            op=num(bar['Open']); vol=num(bar['Volume'])
+            if op is None or op<=0 or vol is None or vol<=0: continue
+            # Avoid buying more than 1% of daily traded dollar value.
+            budget=min(capital/max_positions,cash-brokerage,op*vol*.01)
+            if budget<max(100,brokerage*5): continue
+            fill=op*(1+slip_pct/100)
+            shares=int(budget/fill)
+            if shares<1: continue
+            cost=shares*fill+brokerage
+            if cost>cash: continue
+            cash-=cost
+            positions[s.ticker]={'date':day,'entry':fill,'shares':shares,'cost':cost,'days':0,'strategy':s.strategy}
+        equity=cash
+        for ticker,p in positions.items():
+            h=histories[ticker]
+            hist_close=h.loc[:day,'Close'].dropna()
+            if not hist_close.empty: equity+=p['shares']*float(hist_close.iloc[-1])
+        curve.append({'Date':day,'Equity':equity,'Cash':cash,'Open positions':len(positions)})
+    return pd.DataFrame(curve),pd.DataFrame(trades)
+
+
+def render_strategy_comparison():
+    st.header('⚖️ Strategy Backtest Comparison')
+    st.write('Simulate two independent historical portfolios using the cached ASX OHLCV data. Both start with the same capital and are evaluated over the same dates.')
+    st.warning('Research simulation only. This is NOT a live-trading result. The cached universe generally excludes delisted shares (survivorship bias), adjusted historical prices may change, and spread/market impact estimates are approximate.')
+    a,b,c=st.columns(3)
+    years=a.selectbox('Historical period (years)',[1,2,3,5],index=2,key='compare_years')
+    capital=b.number_input('Starting capital per strategy (AUD)',min_value=1000,max_value=1000000,value=10000,step=1000,key='compare_capital')
+    hold_days=c.selectbox('Maximum holding period (trading sessions)',[10,20,30],index=1,key='compare_hold')
+    a,b,c=st.columns(3)
+    brokerage=a.number_input('Brokerage per trade (AUD)',0.0,100.0,5.0,1.0,key='compare_broker')
+    slippage=b.number_input('Estimated slippage per side (%)',0.0,5.0,0.25,0.05,key='compare_slip')
+    max_tickers=c.selectbox('Cached shares to analyse',[100,250,500,1000,'All'],index=1,key='compare_universe')
+    st.caption('Initial speed setting: 250 alphabetically ordered cached tickers. Select All for broader coverage; it may take several minutes. Use the same universe for both strategies. Signals sampled every 5 trading sessions; no fundamental/news replay.')
+    if st.button('Run historical portfolio comparison',type='primary',key='compare_run'):
+        try:
+            signals,histories,count=_comparison_candidates(years,None if max_tickers=='All' else int(max_tickers))
+            if not histories:
+                st.error('No usable cached OHLCV histories. Run the Phase 4 historical data scan first.')
+            else:
+                end=pd.Timestamp.today().normalize(); start=end-pd.DateOffset(years=years)
+                results={}
+                for strategy in ('Consistent Gains','Breakout Opportunities'):
+                    selected=signals[signals['strategy']==strategy] if not signals.empty else pd.DataFrame()
+                    curve,trades=_comparison_simulate(selected,histories,start,end,capital,hold_days,brokerage,slippage)
+                    results[strategy]=(curve,trades,len(selected))
+                st.session_state['compare_result']=(results,count,years,capital,hold_days)
+        except Exception as exc:
+            st.error(f'Backtest could not finish: {exc}')
+    if 'compare_result' not in st.session_state: return
+    results,count,used_years,used_capital,used_hold=st.session_state['compare_result']
+    st.caption(f'Last completed run: {count:,} cached tickers · {used_years} year(s) · ${used_capital:,.0f} per strategy · {used_hold}-session maximum holding period. Change settings and rerun to update.')
+    summary=[]; plot=[]
+    for strategy,(curve,trades,signals_n) in results.items():
+        if curve.empty: continue
+        values=curve['Equity'].astype(float)
+        dd=(values/values.cummax()-1)*100
+        wins=trades['Net P/L (AUD)'].gt(0) if not trades.empty else pd.Series(dtype=bool)
+        profits=trades['Net P/L (AUD)'] if not trades.empty else pd.Series(dtype=float)
+        losses=-profits[profits<0].sum(); gains=profits[profits>0].sum()
+        summary.append({'Strategy':strategy,'Signals':signals_n,'Trades':len(trades),
+            'Final equity (AUD)':round(values.iloc[-1],2),'Return %':round((values.iloc[-1]/used_capital-1)*100,2),
+            'Max drawdown %':round(dd.min(),2),'Win rate %':round(wins.mean()*100,1) if len(wins) else np.nan,
+            'Profit factor':round(gains/losses,2) if losses>0 else np.nan})
+        plot.append(curve[['Date','Equity']].set_index('Date').rename(columns={'Equity':strategy}))
+    if not summary: st.warning('No trading sessions available for this test.'); return
+    st.subheader('Portfolio results')
+    st.dataframe(pd.DataFrame(summary),hide_index=True,use_container_width=True)
+    st.line_chart(pd.concat(plot,axis=1).ffill())
+    for strategy,(curve,trades,signals_n) in results.items():
+        with st.expander(f'{strategy}: {len(trades)} completed trades'):
+            if trades.empty: st.info('No trades qualified. Try a broader cached universe or check that sufficient price histories are saved.')
+            else:
+                st.dataframe(trades,hide_index=True,use_container_width=True)
+                st.download_button(f'Download {strategy} trades',trades.to_csv(index=False).encode(),file_name=f"{strategy.lower().replace(' ','_')}_backtest_trades.csv",mime='text/csv',key='compare_download_'+strategy)
+    st.subheader('Date-based holdout')
+    st.caption('The final 30% of the period is shown separately as a descriptive holdout. The rules were chosen before this run, but adjusting them after viewing these results makes the holdout exploratory rather than untouched.')
+    for strategy,(curve,trades,_) in results.items():
+        if curve.empty: continue
+        split=curve['Date'].iloc[int(len(curve)*.7)]
+        earlier=curve[curve['Date']<split]; later=curve[curve['Date']>=split]
+        if earlier.empty or later.empty: continue
+        base=float(earlier['Equity'].iloc[-1]); finish=float(later['Equity'].iloc[-1])
+        st.write(f'**{strategy}:** last 30% ({split.date()} onward): {(finish/base-1)*100:+.2f}% portfolio return; {len(trades[trades["Entry date"]>=split.date().isoformat()])} new entries.')
+    st.caption('Entries use the next available open; stops and targets are evaluated from subsequent OHLC bars, with stops assumed first if both touched. The test caps new positions at 1% of that day’s reported traded value. No short selling, borrowing or reinvested dividends. Signals use only past data; actual results may differ significantly.')
+
 with st.sidebar:
-    page=st.radio("Page",["Today’s Opportunities","Consistent Gains","Breakout Opportunities","Single-Share Analysis","Automatic Share Scanner","Early-Mover Tracker","VPA Scanner","Prediction Lab","Phase 4 Backtest","Historical Signal Explorer","Sector Performance","Sector Prediction Accuracy","Lower-Risk Investing","Value Investing","Momentum Trading","High-Growth Shares","Long-Term Investing","Portfolio Planner"])
+    page=st.radio("Page",["Today’s Opportunities","Consistent Gains","Breakout Opportunities","Strategy Backtest Comparison","Single-Share Analysis","Automatic Share Scanner","Early-Mover Tracker","VPA Scanner","Prediction Lab","Phase 4 Backtest","Historical Signal Explorer","Sector Performance","Sector Prediction Accuracy","Lower-Risk Investing","Value Investing","Momentum Trading","High-Growth Shares","Long-Term Investing","Portfolio Planner"])
     st.divider()
     ticker_text=st.text_area("ASX tickers (commas or new lines)",", ".join(MASTER_TICKERS),height=160,
         help="Defaults to the bundled ASX company list. Edit or paste your own tickers if needed.")
@@ -2798,6 +2986,9 @@ elif page=="Historical Signal Explorer":
                 st.caption("Signals use the close of the signal date; future returns start after that close. Missing future returns mean the horizon has not yet completed. Scores are screening heuristics, not probabilities. The displayed early-mover score uses original fixed weights, not weights learned from later observations.")
             except Exception as exc:
                 st.error(f"Could not analyse {symbol}: {exc}")
+
+elif page=="Strategy Backtest Comparison":
+    render_strategy_comparison()
 
 elif page=="Phase 4 Backtest":
     st.header("🧪 Phase 4 — Historical Backtest & Diagnostics")
