@@ -538,7 +538,7 @@ def db_connect():
     return con
 
 # Backups are staged on disk to avoid holding a multi-GB database in Streamlit session state.
-BACKUP_CHUNK_BYTES = 100 * 1024 * 1024  # below Streamlit's default 200 MB upload limit
+BACKUP_CHUNK_BYTES = 20 * 1024 * 1024  # smaller chunks reduce Streamlit download memory pressure
 BACKUP_STAGE = Path(tempfile.gettempdir()) / "asx_backup_staging"
 RESTORE_STAGE = Path(tempfile.gettempdir()) / "asx_restore_staging"
 
@@ -604,7 +604,7 @@ def render_database_backup(key_prefix):
             with st.spinner("Taking a consistent SQLite snapshot and compressing it. Large databases can take several minutes…"):
                 folder, manifest = prepare_split_backup()
             st.session_state["split_backup_folder"] = str(folder)
-            st.success(f"Prepared {len(manifest['parts'])} part(s), each at most 100 MiB.")
+            st.success(f"Prepared {len(manifest['parts'])} part(s), each at most 20 MiB.")
         except Exception as exc:
             st.error(f"Backup preparation failed: {exc}")
     folder_name = st.session_state.get("split_backup_folder")
@@ -613,20 +613,33 @@ def render_database_backup(key_prefix):
         manifest = json.loads((folder / "manifest.json").read_text())
         st.download_button("Download manifest.json FIRST", data=(folder / "manifest.json").read_bytes(),
                            file_name="asx_backup_manifest.json", mime="application/json", key=f"{key_prefix}_manifest")
-        for item in manifest["parts"]:
-            part = folder / item["name"]
-            # Download buttons hold their payload in memory; only read the requested 100 MiB part.
-            with st.expander(f"Download {item['name']} ({item['size'] / 1048576:.1f} MiB)"):
-                st.download_button(f"Download {item['name']}", data=part.read_bytes(),
-                                   file_name=item["name"], mime="application/octet-stream",
-                                   key=f"{key_prefix}_{item['name']}")
+        # Render only one part at a time: Streamlit otherwise reads EVERY part
+        # into memory on each rerun, even when its expander is closed.
+        parts = manifest["parts"]
+        selected_name = st.selectbox(
+            "Choose a backup part to download",
+            options=[item["name"] for item in parts],
+            format_func=lambda name: f"{name} ({next(x['size'] for x in parts if x['name'] == name) / 1048576:.1f} MiB)",
+            key=f"{key_prefix}_selected_backup_part",
+        )
+        selected = next(item for item in parts if item["name"] == selected_name)
+        part = folder / selected_name
+        if part.is_file():
+            st.download_button(
+                f"Download {selected_name}", data=part.read_bytes(),
+                file_name=selected_name, mime="application/octet-stream",
+                key=f"{key_prefix}_download_selected_part",
+            )
+            st.caption(f"Part {parts.index(selected) + 1} of {len(parts)}. Select the next part after this download finishes.")
+        else:
+            st.error("This backup part is no longer on the server. Prepare a fresh backup.")
         st.info("Save every part and the manifest somewhere permanent. Streamlit Cloud storage is temporary.")
 
 
 def render_database_restore():
     with st.expander("Restore prediction database (split backup or existing SQLite file)"):
         st.warning("Restore REPLACES the current database. Download a backup of the current database first. Cloud disk storage is temporary; do not reboot during restoration.")
-        st.caption("For a new backup: upload its manifest once, then upload ONE part at a time in order. The app saves parts on disk between uploads. For your existing 2 GB .sqlite file, split it locally into 100 MiB parts first; see the included helper script.")
+        st.caption("For a new backup: upload its manifest once, then upload ONE part at a time in order. The app saves parts on disk between uploads. For your existing 2 GB .sqlite file, split it locally into parts no larger than 20 MiB first; see the included helper script.")
         manifest_upload = st.file_uploader("Upload backup manifest (.json)", type=["json"], key="restore_manifest_upload")
         if st.button("Start new restore from manifest", disabled=manifest_upload is None, key="restore_manifest_start"):
             try:
