@@ -1358,7 +1358,7 @@ def render_portfolio_simulator(bt):
                            ('${:,.2f}','{:+.2f}%','{:.2f}%','{:,.0f}')):
         col.metric(key,fmt.format(stats[key]))
     st.caption(f"Win rate: {stats['Win rate %']:.1f}% | Annualised return: {stats['Annualised return %']:+.2f}% | "
-               f"Candidates: {stats['Candidate signals']:,} | Open positions at end: {stats['Open positions']}")
+               f"Candidates: {stats['Candidate signals']:,} | Open positions at end: {stats['Open positions at end']}")
     st.line_chart(result['equity'].set_index('Date')['Equity AUD'])
     st.write('**Closed trades**')
     st.dataframe(result['trades'],use_container_width=True,hide_index=True)
