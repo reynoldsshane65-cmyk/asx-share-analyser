@@ -2482,7 +2482,14 @@ def render_strategy_comparison():
         except Exception as exc:
             st.error(f'Backtest could not finish: {exc}')
     if 'compare_result' not in st.session_state: return
-    results,count,used_years,used_capital,used_hold,used_broker,used_slip,used_min_buy,used_slots,used_participation=st.session_state['compare_result']
+    # Results saved by older app versions have a different tuple shape.
+    # Discard only that stale comparison, never the historical database.
+    saved_comparison = st.session_state['compare_result']
+    if not isinstance(saved_comparison, tuple) or len(saved_comparison) != 10:
+        st.session_state.pop('compare_result', None)
+        st.info('The previous comparison used an older app version. Click Run historical portfolio comparison to calculate fresh results with the Stake settings.')
+        return
+    results,count,used_years,used_capital,used_hold,used_broker,used_slip,used_min_buy,used_slots,used_participation=saved_comparison
     st.caption(f'Last completed run: {count:,} cached tickers · {used_years} year(s) · ${used_capital:,.0f} per strategy · {used_hold}-session maximum holding period. Change settings and rerun to update.')
     summary=[]; plot=[]
     for strategy,(curve,trades,signals_n,diagnostics) in results.items():
@@ -2514,7 +2521,7 @@ def render_strategy_comparison():
                 st.download_button(f'Download {strategy} trades',trades.to_csv(index=False).encode(),file_name=f"{strategy.lower().replace(' ','_')}_backtest_trades.csv",mime='text/csv',key='compare_download_'+strategy)
     st.subheader('Date-based holdout')
     st.caption('The final 30% of the period is shown separately as a descriptive holdout. The rules were chosen before this run, but adjusting them after viewing these results makes the holdout exploratory rather than untouched.')
-    for strategy,(curve,trades,_) in results.items():
+    for strategy,(curve,trades,signals_n,diagnostics) in results.items():
         if curve.empty: continue
         split=curve['Date'].iloc[int(len(curve)*.7)]
         earlier=curve[curve['Date']<split]; later=curve[curve['Date']>=split]
