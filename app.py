@@ -2346,12 +2346,17 @@ def _comparison_candidates(years, max_tickers, signal_spacing=5):
     return pd.DataFrame(candidates,columns=['date','ticker','strategy','score','liquidity','volatility']),histories,len(codes)
 
 
-def _comparison_simulate(signals, histories, start, end, capital, hold_days, brokerage, slip_pct, max_positions=5):
-    """Buy at next recorded open, mark daily at close, exit at stop/target/timeout."""
+def _comparison_simulate(signals, histories, start, end, capital, hold_days, brokerage, slip_pct,
+                         max_positions=2, min_first_buy=500.0, participation_pct=1.0):
+    """Cash-constrained ASX paper portfolio; whole shares and Stake first-buy minimum.
+
+    A signal is known after its close and entered at the next available open.
+    First buys of a ticker must be at least min_first_buy in share consideration,
+    excluding brokerage. No leverage, and daily volume participation is capped.
+    """
     sessions=sorted({d for h in histories.values() for d in h.index if start<=d<=end})
-    if not sessions: return pd.DataFrame(),pd.DataFrame()
-    # Signals are generated after close. Orders execute at each ticker's next session open.
-    orders={}; by_date={}
+    if not sessions: return pd.DataFrame(),pd.DataFrame(),{}
+    orders={}
     for row in signals.itertuples(index=False):
         h=histories[row.ticker]
         idx=h.index.searchsorted(row.date,side='right')
@@ -2360,13 +2365,20 @@ def _comparison_simulate(signals, histories, start, end, capital, hold_days, bro
         if entry_date>end: continue
         orders.setdefault(entry_date,[]).append(row)
     cash=float(capital); positions={}; trades=[]; curve=[]
+    first_bought=set()
+    diagnostics={'Signals':len(signals),'Orders considered':0,'Skipped minimum purchase':0,
+                 'Skipped insufficient cash':0,'Skipped liquidity cap':0,
+                 'Skipped missing open/volume':0,'Skipped already held':0,
+                 'Skipped position limit':0,'Buys executed':0,'Brokerage paid (AUD)':0.0,
+                 'Unspent cash at end (AUD)':0.0}
     for day in sessions:
-        # Exit orders on this day's OHLC, with stop-gap and conservative intraday stop handling.
         for ticker,p in list(positions.items()):
             h=histories[ticker]
             if day not in h.index: continue
             bar=h.loc[day]; op=num(bar['Open']); lo=num(bar['Low']); hi=num(bar['High']); cl=num(bar['Close'])
             if cl is None or cl<=0: continue
+            # Entry was at today's open, so no exit before the next trading session.
+            if day<=p['date']: continue
             p['days']+=1
             stop=p['entry']*(.94 if p['strategy']=='Consistent Gains' else .90)
             target=p['entry']*(1.12 if p['strategy']=='Consistent Gains' else 1.25)
@@ -2380,35 +2392,57 @@ def _comparison_simulate(signals, histories, start, end, capital, hold_days, bro
                 exit_price=max(0,exit_price*(1-slip_pct/100))
                 proceeds=p['shares']*exit_price-brokerage
                 cash+=proceeds
-                trades.append({'Ticker':ticker,'Entry date':p['date'].date().isoformat(),'Exit date':day.date().isoformat(),
-                    'Entry price':round(p['entry'],4),'Exit price':round(exit_price,4),'Net P/L (AUD)':round(proceeds-p['cost'],2),
+                diagnostics['Brokerage paid (AUD)']+=brokerage
+                trades.append({'Ticker':ticker,'Entry date':p['date'].date().isoformat(),
+                    'Exit date':day.date().isoformat(),'Shares':p['shares'],
+                    'Entry price':round(p['entry'],4),'Exit price':round(exit_price,4),
+                    'Buy consideration (AUD)':round(p['shares']*p['entry'],2),
+                    'Net P/L (AUD)':round(proceeds-p['cost'],2),
                     'Return %':round((proceeds/p['cost']-1)*100,2),'Exit reason':reason})
                 del positions[ticker]
-        # Only fill orders if the next session opens and cash is available.
         picks=sorted(orders.get(day,[]),key=lambda r:(-r.score,r.ticker))
         for s in picks:
-            if len(positions)>=max_positions: break
-            if s.ticker in positions: continue
+            diagnostics['Orders considered']+=1
+            if len(positions)>=max_positions:
+                diagnostics['Skipped position limit']+=1; continue
+            if s.ticker in positions:
+                diagnostics['Skipped already held']+=1; continue
             h=histories[s.ticker]; bar=h.loc[day]
             op=num(bar['Open']); vol=num(bar['Volume'])
-            if op is None or op<=0 or vol is None or vol<=0: continue
-            # Avoid buying more than 1% of daily traded dollar value.
-            budget=min(capital/max_positions,cash-brokerage,op*vol*.01)
-            if budget<max(100,brokerage*5): continue
+            if op is None or op<=0 or vol is None or vol<=0 or not np.isfinite(op*vol):
+                diagnostics['Skipped missing open/volume']+=1; continue
             fill=op*(1+slip_pct/100)
+            # Allocate up to an equal slot of initial capital, but never borrow.
+            # If an existing position leaves less than the first-buy minimum,
+            # wait for it to close instead of making a non-compliant $200 buy.
+            cash_budget=min(float(capital)/max_positions,cash-brokerage)
+            if cash_budget<min_first_buy:
+                diagnostics['Skipped insufficient cash']+=1; continue
+            liquidity_budget=op*vol*(participation_pct/100.0)
+            if liquidity_budget<min_first_buy:
+                diagnostics['Skipped liquidity cap']+=1; continue
+            budget=min(cash_budget,liquidity_budget)
             shares=int(budget/fill)
-            if shares<1: continue
-            cost=shares*fill+brokerage
-            if cost>cash: continue
+            consideration=shares*fill
+            if shares<1 or consideration+1e-8<min_first_buy:
+                diagnostics['Skipped minimum purchase']+=1; continue
+            cost=consideration+brokerage
+            if cost>cash+1e-8:
+                diagnostics['Skipped insufficient cash']+=1; continue
             cash-=cost
-            positions[s.ticker]={'date':day,'entry':fill,'shares':shares,'cost':cost,'days':0,'strategy':s.strategy}
+            diagnostics['Brokerage paid (AUD)']+=brokerage
+            diagnostics['Buys executed']+=1
+            first_bought.add(s.ticker)
+            positions[s.ticker]={'date':day,'entry':fill,'shares':shares,'cost':cost,
+                                 'days':0,'strategy':s.strategy}
         equity=cash
         for ticker,p in positions.items():
-            h=histories[ticker]
-            hist_close=h.loc[:day,'Close'].dropna()
+            hist_close=histories[ticker].loc[:day,'Close'].dropna()
             if not hist_close.empty: equity+=p['shares']*float(hist_close.iloc[-1])
         curve.append({'Date':day,'Equity':equity,'Cash':cash,'Open positions':len(positions)})
-    return pd.DataFrame(curve),pd.DataFrame(trades)
+    diagnostics['Unspent cash at end (AUD)']=round(cash,2)
+    diagnostics['Open positions at end']=len(positions)
+    return pd.DataFrame(curve),pd.DataFrame(trades),diagnostics
 
 
 def render_strategy_comparison():
@@ -2417,12 +2451,20 @@ def render_strategy_comparison():
     st.warning('Research simulation only. This is NOT a live-trading result. The cached universe generally excludes delisted shares (survivorship bias), adjusted historical prices may change, and spread/market impact estimates are approximate.')
     a,b,c=st.columns(3)
     years=a.selectbox('Historical period (years)',[1,2,3,5],index=2,key='compare_years')
-    capital=b.number_input('Starting capital per strategy (AUD)',min_value=1000,max_value=1000000,value=10000,step=1000,key='compare_capital')
+    capital=b.number_input('Starting capital per strategy (AUD)',min_value=1000,max_value=1000000,value=1000,step=500,key='compare_capital')
     hold_days=c.selectbox('Maximum holding period (trading sessions)',[10,20,30],index=1,key='compare_hold')
     a,b,c=st.columns(3)
-    brokerage=a.number_input('Brokerage per trade (AUD)',0.0,100.0,5.0,1.0,key='compare_broker')
+    brokerage=a.number_input('Brokerage per trade (AUD)',0.0,100.0,3.0,1.0,key='compare_broker')
     slippage=b.number_input('Estimated slippage per side (%)',0.0,5.0,0.25,0.05,key='compare_slip')
     max_tickers=c.selectbox('Cached shares to analyse',[100,250,500,1000,'All'],index=1,key='compare_universe')
+    st.markdown('**Stake ASX small-account settings**')
+    x,y,z=st.columns(3)
+    min_buy=x.number_input('Minimum first purchase (AUD, excluding brokerage)',min_value=0.0,max_value=5000.0,value=500.0,step=50.0,key='compare_min_buy')
+    max_positions=y.selectbox('Maximum open positions',[1,2,3,4,5],index=0,key='compare_max_positions')
+    participation=z.number_input('Maximum share of daily dollar volume (%)',min_value=0.1,max_value=10.0,value=1.0,step=0.5,key='compare_participation')
+    st.caption('Stake ASX standard brokerage defaults to $3 per order. The $500 first-purchase minimum is applied to every buy (conservative: no smaller top-ups). Whole shares only. Slippage is estimated, not a verified market fill. The minimum may differ for some instruments or account circumstances; check Stake terms.')
+    if capital < max_positions * (min_buy + brokerage):
+        st.info('The selected capital cannot fund all position slots at the minimum first-purchase amount. Some slots may stay unused; the simulation will not borrow or place undersized buys.')
     st.caption('Initial speed setting: 250 alphabetically ordered cached tickers. Select All for broader coverage; it may take several minutes. Use the same universe for both strategies. Signals sampled every 5 trading sessions; no fundamental/news replay.')
     if st.button('Run historical portfolio comparison',type='primary',key='compare_run'):
         try:
@@ -2434,16 +2476,16 @@ def render_strategy_comparison():
                 results={}
                 for strategy in ('Consistent Gains','Breakout Opportunities'):
                     selected=signals[signals['strategy']==strategy] if not signals.empty else pd.DataFrame()
-                    curve,trades=_comparison_simulate(selected,histories,start,end,capital,hold_days,brokerage,slippage)
-                    results[strategy]=(curve,trades,len(selected))
-                st.session_state['compare_result']=(results,count,years,capital,hold_days)
+                    curve,trades,diagnostics=_comparison_simulate(selected,histories,start,end,capital,hold_days,brokerage,slippage,max_positions,min_buy,participation)
+                    results[strategy]=(curve,trades,len(selected),diagnostics)
+                st.session_state['compare_result']=(results,count,years,capital,hold_days,brokerage,slippage,min_buy,max_positions,participation)
         except Exception as exc:
             st.error(f'Backtest could not finish: {exc}')
     if 'compare_result' not in st.session_state: return
-    results,count,used_years,used_capital,used_hold=st.session_state['compare_result']
+    results,count,used_years,used_capital,used_hold,used_broker,used_slip,used_min_buy,used_slots,used_participation=st.session_state['compare_result']
     st.caption(f'Last completed run: {count:,} cached tickers · {used_years} year(s) · ${used_capital:,.0f} per strategy · {used_hold}-session maximum holding period. Change settings and rerun to update.')
     summary=[]; plot=[]
-    for strategy,(curve,trades,signals_n) in results.items():
+    for strategy,(curve,trades,signals_n,diagnostics) in results.items():
         if curve.empty: continue
         values=curve['Equity'].astype(float)
         dd=(values/values.cummax()-1)*100
@@ -2453,14 +2495,19 @@ def render_strategy_comparison():
         summary.append({'Strategy':strategy,'Signals':signals_n,'Trades':len(trades),
             'Final equity (AUD)':round(values.iloc[-1],2),'Return %':round((values.iloc[-1]/used_capital-1)*100,2),
             'Max drawdown %':round(dd.min(),2),'Win rate %':round(wins.mean()*100,1) if len(wins) else np.nan,
-            'Profit factor':round(gains/losses,2) if losses>0 else np.nan})
+            'Profit factor':round(gains/losses,2) if losses>0 else np.nan,
+            'Brokerage paid (AUD)':round(diagnostics['Brokerage paid (AUD)'],2),
+            'Final cash (AUD)':diagnostics['Unspent cash at end (AUD)']})
         plot.append(curve[['Date','Equity']].set_index('Date').rename(columns={'Equity':strategy}))
     if not summary: st.warning('No trading sessions available for this test.'); return
+    st.caption(f'Applied: ${used_broker:.2f} per buy/sell · {used_slip:.2f}% slippage per side · ${used_min_buy:.0f} minimum purchase · {used_slots} positions · {used_participation:.1f}% daily-volume cap.')
     st.subheader('Portfolio results')
     st.dataframe(pd.DataFrame(summary),hide_index=True,use_container_width=True)
     st.line_chart(pd.concat(plot,axis=1).ffill())
-    for strategy,(curve,trades,signals_n) in results.items():
+    for strategy,(curve,trades,signals_n,diagnostics) in results.items():
         with st.expander(f'{strategy}: {len(trades)} completed trades'):
+            st.write('Order diagnostics (why candidate trades were skipped):')
+            st.dataframe(pd.DataFrame([diagnostics]),hide_index=True,use_container_width=True)
             if trades.empty: st.info('No trades qualified. Try a broader cached universe or check that sufficient price histories are saved.')
             else:
                 st.dataframe(trades,hide_index=True,use_container_width=True)
