@@ -1356,6 +1356,163 @@ def simulate_historical_portfolio(signals, rule, hold_days, start_date, capital=
     return {'equity':eq,'trades':trades,'stats':stats,'skipped':skipped,'rejected':rejected},None
 
 
+def analyse_trend_filter_outcomes(signals, rule, hold_days, costs_pct, min_price,
+                                  min_dollar_volume, max_daily_volatility, start_date=None):
+    """Compare signal outcomes on both sides of the 50D filter, without portfolio sizing.
+
+    All checks use data available before the next-session open. Fixed-horizon
+    outcomes use that open and a later close; no stop/target execution is implied.
+    """
+    data = signals.copy()
+    data['Signal date'] = pd.to_datetime(data['Signal date'], errors='coerce').dt.normalize()
+    for col in ('Score', 'VPA Score', 'Accumulation Score', 'Distribution Safety'):
+        data[col] = pd.to_numeric(data[col], errors='coerce') if col in data else np.nan
+    score, vpa, accum, safety = rule
+    mask = data['Score'] >= score
+    if vpa is not None: mask &= data['VPA Score'] >= vpa
+    if accum is not None: mask &= data['Accumulation Score'] >= accum
+    if safety is not None: mask &= data['Distribution Safety'] >= safety
+    if start_date is not None: mask &= data['Signal date'] >= pd.Timestamp(start_date)
+    data = data.loc[mask].dropna(subset=['Signal date', 'Ticker'])
+    rows = []
+    skipped = {'missing cached prices': 0, 'no next opening': 0,
+               'minimum price': 0, 'liquidity': 0, 'volatility': 0,
+               'insufficient future sessions': 0, 'invalid future prices': 0}
+    horizons = (5, 10, 20, 30)
+    for ticker, group in data.groupby('Ticker'):
+        bars = load_historical_prices(str(ticker))
+        if bars.empty:
+            skipped['missing cached prices'] += len(group)
+            continue
+        bars = bars[~bars.index.duplicated(keep='last')].sort_index().copy()
+        for col in ('Open', 'Close', 'Volume'):
+            bars[col] = pd.to_numeric(bars[col], errors='coerce')
+        close = bars['Close']
+        prior_ma = close.shift(1).rolling(50, min_periods=50).mean()
+        prior_vol = close.pct_change().shift(1).rolling(20, min_periods=20).std() * 100
+        prior_adv = (close * bars['Volume']).shift(1).rolling(20, min_periods=20).mean()
+        for _, signal in group.iterrows():
+            ix = int(bars.index.searchsorted(signal['Signal date'], side='right'))
+            if ix >= len(bars):
+                skipped['no next opening'] += 1
+                continue
+            op = num(bars['Open'].iloc[ix])
+            if op is None or not np.isfinite(op) or op <= 0:
+                skipped['no next opening'] += 1
+                continue
+            if op < min_price:
+                skipped['minimum price'] += 1
+                continue
+            adv = num(prior_adv.iloc[ix])
+            if adv is None or not np.isfinite(adv) or adv < min_dollar_volume:
+                skipped['liquidity'] += 1
+                continue
+            volatility = num(prior_vol.iloc[ix])
+            if max_daily_volatility > 0 and (volatility is None or not np.isfinite(volatility) or volatility > max_daily_volatility):
+                skipped['volatility'] += 1
+                continue
+            previous_close = num(close.iloc[ix - 1]) if ix else None
+            moving_average = num(prior_ma.iloc[ix])
+            if previous_close is None or moving_average is None or not np.isfinite(previous_close) or not np.isfinite(moving_average):
+                classification = 'Rejected: missing 50D data'
+            elif previous_close > moving_average:
+                classification = 'Accepted: above 50D MA'
+            else:
+                classification = 'Rejected: at/below 50D MA'
+            record = {'Ticker': str(ticker), 'Signal date': str(signal['Signal date'].date()),
+                      'Entry date': str(bars.index[ix].date()), 'Trend group': classification,
+                      'Previous close': previous_close, 'Prior 50D MA': moving_average,
+                      'Entry open': op, 'Prior volatility %': volatility}
+            for horizon in horizons:
+                # Horizon 1 is entry-session close; horizon 5 is the fifth session close.
+                exit_ix = ix + horizon - 1
+                outcome = np.nan
+                if exit_ix < len(bars):
+                    exit_price = num(close.iloc[exit_ix])
+                    if exit_price is not None and np.isfinite(exit_price) and exit_price > 0:
+                        outcome = (exit_price / op - 1) * 100 - costs_pct
+                record[f'Return {horizon}d net %'] = outcome
+            exit_ix = ix + int(hold_days) - 1
+            if exit_ix >= len(bars):
+                skipped['insufficient future sessions'] += 1
+                continue
+            exit_price = num(close.iloc[exit_ix])
+            if exit_price is None or not np.isfinite(exit_price) or exit_price <= 0:
+                skipped['invalid future prices'] += 1
+                continue
+            record['Strategy-hold net %'] = (exit_price / op - 1) * 100 - costs_pct
+            rows.append(record)
+    detail = pd.DataFrame(rows)
+    if detail.empty:
+        return detail, pd.DataFrame(), skipped
+    summary = []
+    for group_name, part in detail.groupby('Trend group'):
+        outcome = part['Strategy-hold net %'].dropna()
+        wins = outcome[outcome > 0]
+        losses = outcome[outcome < 0]
+        item = {'Trend group': group_name, 'Signals': len(part),
+                'Hold win rate %': float((outcome > 0).mean() * 100),
+                'Hold average net %': float(outcome.mean()),
+                'Average winner %': float(wins.mean()) if len(wins) else np.nan,
+                'Average loser %': float(losses.mean()) if len(losses) else np.nan}
+        for horizon in horizons:
+            values = part[f'Return {horizon}d net %'].dropna()
+            item[f'{horizon}d observations'] = len(values)
+            item[f'{horizon}d avg net %'] = float(values.mean()) if len(values) else np.nan
+            item[f'{horizon}d win rate %'] = float((values > 0).mean() * 100) if len(values) else np.nan
+        summary.append(item)
+    return detail, pd.DataFrame(summary), skipped
+
+
+def render_filter_effectiveness_analyser(bt, rule, hold, saved, liquidity):
+    st.markdown('### Filter Effectiveness Analyser — 50-day trend')
+    st.caption('Compares the SAME score-qualified signals above and at/below their prior 50-day average. '
+               'Checks price, liquidity and volatility before grouping. Entry is the next available session open; '
+               'returns use later session closes and subtract estimated round-trip costs. '
+               'This is a signal-level comparison, NOT a portfolio simulation.')
+    a, b = st.columns(2)
+    with a:
+        vol = st.selectbox('Volatility cap for comparison (%)', [0, 2, 3, 4, 5, 7, 10],
+                           index=5, format_func=lambda x: 'Off' if x == 0 else f'{x}%', key='fe_vol')
+    with b:
+        sample = st.selectbox('Historical sample', ['All cached signals', 'Latest 25% of signal dates'], key='fe_sample')
+    signature = (len(bt), str(pd.to_datetime(bt['Signal date'], errors='coerce').max()),
+                 tuple(rule), hold, saved['costs'], saved['price'], liquidity, vol, sample)
+    if st.button('Analyse accepted vs rejected shares', key='fe_run'):
+        start = None
+        if sample != 'All cached signals':
+            dates = pd.to_datetime(bt['Signal date'], errors='coerce').dropna().sort_values().unique()
+            if len(dates): start = pd.Timestamp(dates[int(len(dates) * .75)])
+        with st.spinner('Comparing historical outcomes from cached daily prices...'):
+            detail, summary, skipped = analyse_trend_filter_outcomes(
+                bt, rule, hold, saved['costs'], saved['price'], liquidity, vol, start)
+        st.session_state['fe_result'] = {'signature': signature, 'detail': detail,
+                                         'summary': summary, 'skipped': skipped}
+    result = st.session_state.get('fe_result')
+    if not result: return
+    if result['signature'] != signature:
+        st.info('Settings changed. Run the comparison again.')
+        return
+    if result['detail'].empty:
+        st.warning('No eligible signals with complete future prices were found. Check cached history and settings.')
+    else:
+        st.dataframe(result['summary'].round(2), hide_index=True, use_container_width=True)
+        st.download_button('Download filter comparison summary CSV',
+                           result['summary'].to_csv(index=False).encode(),
+                           file_name='asx_filter_effectiveness_summary.csv', mime='text/csv', key='fe_summary_csv')
+        with st.expander('Individual signal outcomes and CSV'):
+            st.dataframe(result['detail'].round(3), hide_index=True, use_container_width=True)
+            st.download_button('Download all accepted/rejected signal outcomes CSV',
+                               result['detail'].to_csv(index=False).encode(),
+                               file_name='asx_filter_effectiveness_signals.csv', mime='text/csv', key='fe_detail_csv')
+    with st.expander('Excluded signals and data availability'):
+        st.dataframe(pd.DataFrame([{'Reason': k, 'Signals': v} for k, v in result['skipped'].items()]),
+                     hide_index=True, use_container_width=True)
+    st.warning('Exploratory historical comparison only. Signals can overlap, and missing/delisted stocks can bias results. '
+               'A rejected signal is not an executed losing trade; results omit portfolio constraints, stop/target paths, '
+               'market impact and taxes. Do not use the same sample repeatedly to tune and then claim independent validation.')
+
+
 def render_walk_forward_testing(bt, rule, hold, saved, capital, positions, allocation, liquidity, participation):
     """Rolling, chronological parameter selection; only earlier windows choose each fold's rule."""
     st.markdown('### Walk-forward strategy testing')
@@ -1529,6 +1686,7 @@ def render_automatic_strategy_testing(bt):
     st.dataframe(pd.DataFrame([{'Reason':k,'Rejected signals':v} for k,v in result.get('skipped',{}).items()]),hide_index=True,use_container_width=True)
     st.caption(f"Eligible candidates: {stats['Candidate signals']}; eligible tickers: {stats.get('Eligible tickers', 'unknown')}.")
     render_walk_forward_testing(bt, rule, hold, saved, capital, positions, allocation, liquidity, participation)
+    render_filter_effectiveness_analyser(bt, rule, hold, saved, liquidity)
     st.warning('The optimiser rule was already selected using this historical dataset, so this is not a fully independent test of the entire strategy. Repeated runs and parameter changes on the same holdout introduce overfitting. Signals are sampled; delisted shares, execution uncertainty and corporate-action data can affect results. Forward paper testing is needed.')
 
 
