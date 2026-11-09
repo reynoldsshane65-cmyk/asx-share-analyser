@@ -2755,10 +2755,46 @@ def _sd_select(frame, rule):
     return frame.loc[mask]
 
 
+def _sd_rank_model(training, rule):
+    """Freeze factor scaling using training-period observations only."""
+    model = []
+    for col, direction, cutoff in rule:
+        values = pd.to_numeric(training[col], errors='coerce').replace([np.inf, -np.inf], np.nan).dropna()
+        if values.empty:
+            continue
+        lo, hi = (float(values.quantile(q)) for q in (.10, .90))
+        model.append((col, direction, lo, hi))
+    return model
+
+
+def _sd_rank_signals(frame, rank_model):
+    """Rank competing entry-day candidates without using any forward outcomes.
+
+    Equal-weight normalized factor strength. Normalization is fixed from training;
+    ticker is used only as a deterministic final tie-breaker.
+    """
+    result = frame.copy()
+    if result.empty:
+        result['Selection score'] = pd.Series(dtype=float)
+        return result
+    parts = []
+    for col, direction, lo, hi in rank_model:
+        x = pd.to_numeric(result[col], errors='coerce')
+        if hi <= lo:
+            strength = pd.Series(0.5, index=result.index, dtype=float)
+        else:
+            strength = ((x-lo)/(hi-lo)).clip(0, 1)
+        if direction == 'low':
+            strength = 1-strength
+        parts.append(strength.fillna(0))
+    result['Selection score'] = (sum(parts)/len(parts)*100) if parts else 0.0
+    return result
+
+
 def _sd_portfolio(frame, horizon, capital, brokerage, slippage, min_purchase=500):
     """Single-position, whole-share, cash-only fixed-horizon test; close-equity drawdown."""
     if frame.empty: return {'Trades': 0, 'Final equity AUD': capital, 'Return %': 0., 'Win rate %': np.nan, 'Max closed-equity drawdown %': 0., 'Brokerage AUD': 0.}, pd.DataFrame()
-    f=frame.dropna(subset=['Entry date',f'Exit date {horizon}d',f'Return {horizon}d %','Entry']).sort_values(['Entry date','Ticker'])
+    f=frame.dropna(subset=['Entry date',f'Exit date {horizon}d',f'Return {horizon}d %','Entry']).sort_values(['Entry date','Selection score','Ticker'],ascending=[True,False,True])
     cash=float(capital); free_at=pd.Timestamp.min; peak=cash; drawdown=0.; trades=[]
     for r in f.itertuples(index=False, name=None):
         row=dict(zip(f.columns,r)); entry_date=pd.Timestamp(row['Entry date']); exit_date=pd.Timestamp(row[f'Exit date {horizon}d'])
@@ -2779,6 +2815,7 @@ def _sd_portfolio(frame, horizon, capital, brokerage, slippage, min_purchase=500
         drawdown=min(drawdown,(cash/peak-1)*100)
         trades.append({'Ticker':row['Ticker'],'Entry date':entry_date.date().isoformat(),
                        'Exit date':exit_date.date().isoformat(),'Shares':shares,
+                       'Selection score':round(float(row.get('Selection score',0)),1),
                        'Net P/L AUD':round(pnl,2),'Equity after trade AUD':round(cash,2)})
     win=sum(t['Net P/L AUD']>0 for t in trades)
     return {'Trades':len(trades),'Final equity AUD':round(cash,2),
@@ -2862,8 +2899,8 @@ def render_strategy_discovery():
     rule=rules[selected]
     st.write('**Training-derived rules:** '+', '.join(f'{col} {"≤" if direction=="low" else "≥"} {cutoff:,.2f}' for col,direction,cutoff in rule))
     st.subheader('Cash-constrained portfolio replay')
-    st.caption('Only later-evaluation signals are traded. All cash is allocated to at most one share. Trades do not overlap. Same-day competing signals are resolved alphabetically, not by future returns. Results include estimated entry/exit slippage and brokerage.')
-    replay=_sd_select(test,rule)
+    st.caption('Only later-evaluation signals are traded. All cash is allocated to at most one share. Trades do not overlap. Same-day competing signals are ranked by training-scaled factor strength, never future returns. Ticker is used only to break exact score ties. Includes estimated entry/exit slippage and brokerage.')
+    replay=_sd_rank_signals(_sd_select(test,rule),_sd_rank_model(train,rule))
     summary,trades=_sd_portfolio(replay,horizon,capital,brokerage,slip)
     cols=st.columns(4)
     cols[0].metric('Trades',summary['Trades'])
