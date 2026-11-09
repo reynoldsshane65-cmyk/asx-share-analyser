@@ -2530,8 +2530,198 @@ def render_strategy_comparison():
         st.write(f'**{strategy}:** last 30% ({split.date()} onward): {(finish/base-1)*100:+.2f}% portfolio return; {len(trades[trades["Entry date"]>=split.date().isoformat()])} new entries.')
     st.caption('Entries use the next available open; stops and targets are evaluated from subsequent OHLC bars, with stops assumed first if both touched. The test caps new positions at 1% of that day’s reported traded value. No short selling, borrowing or reinvested dividends. Signals use only past data; actual results may differ significantly.')
 
+
+# ---------------- Historical factor discovery (read-only) ----------------
+def _factor_discovery_observations(max_tickers, years, step, min_turnover):
+    """Point-in-time OHLCV factors. Entry at next session open; no future-bar inputs."""
+    con=db_connect()
+    try:
+        codes=[r[0] for r in con.execute(
+            "SELECT ticker FROM historical_prices GROUP BY ticker HAVING COUNT(*)>=160 ORDER BY ticker").fetchall()]
+        if max_tickers:  # Spread the sample across the alphabet rather than using only A/B/C codes.
+            if len(codes)>max_tickers:
+                picks=np.linspace(0,len(codes)-1,max_tickers,dtype=int)
+                codes=[codes[int(i)] for i in picks]
+        cutoff=pd.Timestamp.today().normalize()-pd.DateOffset(years=years)
+        warmup=cutoff-pd.Timedelta(days=450)
+        observations=[]
+        bar=st.progress(0,text='Reading cached prices and computing historical factors…')
+        for j,ticker in enumerate(codes):
+            raw=pd.read_sql_query(
+                "SELECT price_date,open,high,low,close,volume FROM historical_prices WHERE ticker=? AND price_date>=? ORDER BY price_date",
+                con,params=(ticker,warmup.strftime('%Y-%m-%d')))
+            if len(raw)<160:
+                continue
+            raw['price_date']=pd.to_datetime(raw['price_date'],errors='coerce')
+            h=raw.set_index('price_date').sort_index()
+            for k in ('open','high','low','close','volume'):
+                h[k]=pd.to_numeric(h[k],errors='coerce')
+            h=h[~h.index.duplicated(keep='last')].dropna(subset=['close'])
+            c=h['close']; v=h['volume'].fillna(0); prev20=v.shift(1).rolling(20,min_periods=20).mean()
+            ret5=(c/c.shift(5)-1)*100
+            ret21=(c/c.shift(21)-1)*100
+            ret63=(c/c.shift(63)-1)*100
+            ret126=(c/c.shift(126)-1)*100
+            ma50=c.rolling(50,min_periods=50).mean()
+            high20=h['high'].shift(1).rolling(20,min_periods=20).max()
+            high252=h['high'].shift(1).rolling(252,min_periods=252).max()
+            vol20=c.pct_change().rolling(20,min_periods=20).std()*100
+            turnover=(c*v).rolling(20,min_periods=20).mean()
+            relvol=v/prev20.replace(0,np.nan)
+            # Sample one observation every `step` sessions per share to reduce dependence.
+            for i in range(126,len(h)-61,step):
+                date=h.index[i]
+                if date<cutoff: continue
+                px=float(c.iloc[i]); liq=float(turnover.iloc[i])
+                if not np.isfinite(px) or px<0.05 or not np.isfinite(liq) or liq<min_turnover: continue
+                entry=h['open'].iloc[i+1]
+                if pd.isna(entry) or entry<=0: continue
+                # Do not use a future bar for the signal. All factors end at i.
+                row={'Date':date,'Ticker':ticker,'Entry':float(entry),
+                     'Momentum 1M %':float(ret21.iloc[i]),
+                     'Momentum 3M %':float(ret63.iloc[i]),
+                     'Momentum 6M %':float(ret126.iloc[i]),
+                     'Above 50D %':float((px/ma50.iloc[i]-1)*100),
+                     'Distance to 20D high %':float((px/high20.iloc[i]-1)*100),
+                     'Relative volume':float(relvol.iloc[i]),
+                     'Daily volatility %':float(vol20.iloc[i]),
+                     'Dollar turnover':liq}
+                if pd.notna(high252.iloc[i]) and high252.iloc[i]>0:
+                    row['Distance to 52W high %']=float((px/high252.iloc[i]-1)*100)
+                # Existing VPA implementation, using only history available at signal close.
+                segment=h.iloc[max(0,i-119):i+1].rename(columns={
+                    'open':'Open','high':'High','low':'Low','close':'Close','volume':'Volume'})
+                if len(segment)>=30 and segment[['Open','High','Low','Close','Volume']].notna().all().all():
+                    vpa=calculate_vpa(segment[['Open','High','Low','Close','Volume']])
+                    for key in ('VPA Score','Accumulation Score','Distribution Risk'):
+                        row[key]=vpa.get(key,np.nan)
+                for days in (5,10,20,60):
+                    # Enter at next open; exit at close of the specified later session.
+                    exit_px=c.iloc[i+days] if i+days<len(h) else np.nan
+                    row[f'Return {days}d %']=(float(exit_px)/float(entry)-1)*100 if pd.notna(exit_px) and exit_px>0 else np.nan
+                    window=h['high'].iloc[i+1:i+days+1]
+                    row[f'Hit +10% {days}d']=bool((window>=float(entry)*1.10).any())
+                    row[f'Hit +20% {days}d']=bool((window>=float(entry)*1.20).any())
+                    lows=h['low'].iloc[i+1:i+days+1]
+                    row[f'Hit -10% {days}d']=bool((lows<=float(entry)*0.90).any())
+                observations.append(row)
+            if j%10==0 or j==len(codes)-1:
+                bar.progress((j+1)/max(1,len(codes)),text=f'Analysed {j+1:,}/{len(codes):,} cached shares')
+        bar.empty()
+        return pd.DataFrame(observations),len(codes)
+    finally:
+        con.close()
+
+
+def render_factor_discovery():
+    st.header('🔬 Historical Factor Discovery')
+    st.write('Discover whether individual indicators predict subsequent ASX share performance, rather than assuming EMS, VPA or accumulation are the best signals.')
+    st.info('Research only. Uses existing cached historical OHLCV prices; does not change the database or download new data. Prices may exclude delisted shares, and the cached universe can be biased.')
+    a,b,c=st.columns(3)
+    years=a.selectbox('Historical lookback (years)',[1,2,3,5,10],index=2,key='fd_years')
+    maximum=b.selectbox('Cached shares to analyse',[100,250,500,1000,0],index=1,format_func=lambda n:'All cached shares' if n==0 else str(n),key='fd_max')
+    spacing=c.selectbox('Sample every N trading sessions',[10,20,40,60],index=1,key='fd_step')
+    d,e,f=st.columns(3)
+    liquidity=d.number_input('Minimum 20-day average turnover (AUD)',min_value=0.0,value=20000.0,step=10000.0,key='fd_liq')
+    horizon=e.selectbox('Forward holding period (sessions)',[5,10,20,60],index=2,key='fd_horizon')
+    costs=f.number_input('Round-trip brokerage (AUD)',min_value=0.0,value=6.0,step=1.0,key='fd_cost')
+    st.caption('Entry: next trading session open. Exit: future session close. Research assumes a $500 position, 0.25% slippage per side, and $3 Stake brokerage per side by default. Intraday +10%/+20% hits are NOT necessarily achievable exits.')
+    if st.button('Run factor discovery',type='primary',key='fd_run'):
+        with st.spinner('Calculating factors from cached daily prices…'):
+            data,count=_factor_discovery_observations(maximum,years,spacing,liquidity)
+        st.session_state['fd_results']=(data,count,(years,maximum,spacing,liquidity))
+    saved=st.session_state.get('fd_results')
+    if saved is None:
+        return
+    data,count,settings=saved
+    if data.empty:
+        st.warning('Not enough eligible cached OHLCV data. Run Phase 4 Backtest to build the historical price cache, or lower the turnover threshold.')
+        return
+    if settings!=(years,maximum,spacing,liquidity):
+        st.warning('Data shown are from the last completed run. Click Run factor discovery to apply the changed data settings.')
+    ret=f'Return {horizon}d %'; up=f'Hit +10% {horizon}d'; big=f'Hit +20% {horizon}d'; down=f'Hit -10% {horizon}d'
+    # Require a completed forward horizon and exclude untradable/invalid observations.
+    data=data.dropna(subset=[ret,'Entry']).copy()
+    if data.empty:
+        st.warning('No completed future returns for this holding period.')
+        return
+    data['Date']=pd.to_datetime(data['Date'])
+    data=data.sort_values('Date')
+    # Split by DATE, not row number. Purge 90 days before holdout to reduce overlap.
+    unique_dates=np.sort(data['Date'].unique())
+    if len(unique_dates)<25:
+        st.warning('Too few distinct dates for a useful training/holdout comparison.')
+        return
+    split=pd.Timestamp(unique_dates[int(len(unique_dates)*.7)])
+    training=data[data['Date']<split-pd.Timedelta(days=90)].copy()
+    holdout=data[data['Date']>=split].copy()
+    # Approximate round-trip return on a $500 consideration, including brokerage and slippage.
+    fee_pct=costs/500*100+0.5
+    for part in (training,holdout):
+        part['Net return % (approx)']=part[ret]-fee_pct
+    st.write(f'Cached shares sampled: **{count:,}** · completed observations: **{len(data):,}** · training: **{len(training):,}** · holdout: **{len(holdout):,}**')
+    st.caption(f'Holdout begins {split.date()}; 90-day embargo between training and holdout. The holdout is descriptive: changing thresholds after seeing it makes it no longer untouched.')
+    if len(training)<100 or len(holdout)<40:
+        st.warning('Sample is small. Rankings and holdout comparisons may be unstable.')
+    baseline=pd.DataFrame([{'Sample':'Training — all eligible','Observations':len(training),'Avg gross return %':training[ret].mean(),
+                            'Avg net return %':training['Net return % (approx)'].mean(),
+                            '+10% intraday hit %':training[up].mean()*100,'+20% intraday hit %':training[big].mean()*100,
+                            '-10% intraday hit %':training[down].mean()*100},
+                           {'Sample':'Holdout — all eligible','Observations':len(holdout),'Avg gross return %':holdout[ret].mean(),
+                            'Avg net return %':holdout['Net return % (approx)'].mean(),
+                            '+10% intraday hit %':holdout[up].mean()*100,'+20% intraday hit %':holdout[big].mean()*100,
+                            '-10% intraday hit %':holdout[down].mean()*100}])
+    st.subheader('All eligible shares — comparison baseline')
+    st.dataframe(baseline.round(2),use_container_width=True,hide_index=True)
+    st.caption('This baseline is the average eligible cached share, NOT the ASX index. Returns are per signal, not a cash-constrained portfolio. Fees are an approximation and exclude spread, taxes and market impact.')
+    factors=['Momentum 1M %','Momentum 3M %','Momentum 6M %','Above 50D %',
+             'Distance to 20D high %','Distance to 52W high %','Relative volume',
+             'Daily volatility %','Dollar turnover','VPA Score','Accumulation Score','Distribution Risk']
+    rows=[]
+    for factor in factors:
+        if factor not in training.columns: continue
+        train=training.dropna(subset=[factor]); test=holdout.dropna(subset=[factor])
+        if len(train)<40 or len(test)<20 or train[factor].nunique()<5: continue
+        # Top quartile for positive factors; lowest quartile for distribution risk / volatility.
+        low_good=factor in ('Distribution Risk','Daily volatility %')
+        threshold=float(train[factor].quantile(.25 if low_good else .75))
+        tr=train[train[factor]<=threshold] if low_good else train[train[factor]>=threshold]
+        te=test[test[factor]<=threshold] if low_good else test[test[factor]>=threshold]
+        if tr.empty or te.empty: continue
+        rows.append({'Factor':factor,'Selection':'Bottom 25%' if low_good else 'Top 25%',
+                     'Threshold from training':threshold,'Training signals':len(tr),
+                     'Training avg net %':tr['Net return % (approx)'].mean(),
+                     'Training edge vs baseline pp':tr['Net return % (approx)'].mean()-training['Net return % (approx)'].mean(),
+                     'Holdout signals':len(te),'Holdout avg net %':te['Net return % (approx)'].mean(),
+                     'Holdout edge vs baseline pp':te['Net return % (approx)'].mean()-holdout['Net return % (approx)'].mean(),
+                     'Holdout +10% hit %':te[up].mean()*100,
+                     'Holdout +20% hit %':te[big].mean()*100,
+                     'Holdout -10% hit %':te[down].mean()*100})
+    st.subheader('Individual factor comparison')
+    if not rows:
+        st.warning('Insufficient observations to compare factor quartiles.')
+        return
+    table=pd.DataFrame(rows).sort_values('Training edge vs baseline pp',ascending=False)
+    st.dataframe(table.round(2),use_container_width=True,hide_index=True)
+    st.download_button('Download factor comparison CSV',table.to_csv(index=False).encode('utf-8'),
+                       file_name='asx_factor_comparison.csv',mime='text/csv',key='fd_download')
+    st.caption('Thresholds are learned only from training. Holdout edges compare with all eligible holdout shares. Many tests are shown, so some apparent winners may occur by chance.')
+    st.subheader('Inspect one factor')
+    factor=st.selectbox('Factor',table['Factor'].tolist(),key='fd_inspect')
+    chosen=table.loc[table['Factor']==factor].iloc[0]
+    limit=float(chosen['Threshold from training']); lower=factor in ('Distribution Risk','Daily volatility %')
+    t=holdout.dropna(subset=[factor]); selected=t[t[factor]<=limit] if lower else t[t[factor]>=limit]
+    if len(selected):
+        x,y,z=st.columns(3)
+        x.metric('Holdout qualifying signals',f'{len(selected):,}')
+        y.metric('Average net return',f'{selected["Net return % (approx)"].mean():+.2f}%')
+        z.metric('Edge over holdout baseline',f'{chosen["Holdout edge vs baseline pp"]:+.2f} pp')
+        st.dataframe(selected[['Date','Ticker',factor,ret,'Net return % (approx)',up,big,down]].tail(100).sort_values('Date',ascending=False),
+                     use_container_width=True,hide_index=True)
+    st.warning('Important limitations: surviving/current listed tickers, missing delisted companies, corporate-action-adjusted OHLCV, possible stale or missing prices, overlapping outcomes and no sector/index-relative benchmark. Factor rankings are exploratory and cannot establish a reliable trading edge. Avoid optimising against this holdout repeatedly.')
+
 with st.sidebar:
-    page=st.radio("Page",["Today’s Opportunities","Consistent Gains","Breakout Opportunities","Strategy Backtest Comparison","Single-Share Analysis","Automatic Share Scanner","Early-Mover Tracker","VPA Scanner","Prediction Lab","Phase 4 Backtest","Historical Signal Explorer","Sector Performance","Sector Prediction Accuracy","Lower-Risk Investing","Value Investing","Momentum Trading","High-Growth Shares","Long-Term Investing","Portfolio Planner"])
+    page=st.radio("Page",["Today’s Opportunities","Consistent Gains","Breakout Opportunities","Strategy Backtest Comparison","Historical Factor Discovery","Single-Share Analysis","Automatic Share Scanner","Early-Mover Tracker","VPA Scanner","Prediction Lab","Phase 4 Backtest","Historical Signal Explorer","Sector Performance","Sector Prediction Accuracy","Lower-Risk Investing","Value Investing","Momentum Trading","High-Growth Shares","Long-Term Investing","Portfolio Planner"])
     st.divider()
     ticker_text=st.text_area("ASX tickers (commas or new lines)",", ".join(MASTER_TICKERS),height=160,
         help="Defaults to the bundled ASX company list. Edit or paste your own tickers if needed.")
@@ -3043,6 +3233,8 @@ elif page=="Historical Signal Explorer":
 
 elif page=="Strategy Backtest Comparison":
     render_strategy_comparison()
+elif page=="Historical Factor Discovery":
+    render_factor_discovery()
 
 elif page=="Phase 4 Backtest":
     st.header("🧪 Phase 4 — Historical Backtest & Diagnostics")
