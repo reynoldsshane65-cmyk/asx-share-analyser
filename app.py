@@ -2577,7 +2577,7 @@ def _factor_discovery_observations(max_tickers, years, step, min_turnover):
                 entry=h['open'].iloc[i+1]
                 if pd.isna(entry) or entry<=0: continue
                 # Do not use a future bar for the signal. All factors end at i.
-                row={'Date':date,'Ticker':ticker,'Entry':float(entry),
+                row={'Date':date,'Ticker':ticker,'Entry':float(entry), 'Entry date':h.index[i+1],
                      'Momentum 1M %':float(ret21.iloc[i]),
                      'Momentum 3M %':float(ret63.iloc[i]),
                      'Momentum 6M %':float(ret126.iloc[i]),
@@ -2597,6 +2597,7 @@ def _factor_discovery_observations(max_tickers, years, step, min_turnover):
                         row[key]=vpa.get(key,np.nan)
                 for days in (5,10,20,60):
                     # Enter at next open; exit at close of the specified later session.
+                    row[f'Exit date {days}d']=h.index[i+days] if i+days<len(h) else pd.NaT
                     exit_px=c.iloc[i+days] if i+days<len(h) else np.nan
                     row[f'Return {days}d %']=(float(exit_px)/float(entry)-1)*100 if pd.notna(exit_px) and exit_px>0 else np.nan
                     window=h['high'].iloc[i+1:i+days+1]
@@ -2720,8 +2721,163 @@ def render_factor_discovery():
                      use_container_width=True,hide_index=True)
     st.warning('Important limitations: surviving/current listed tickers, missing delisted companies, corporate-action-adjusted OHLCV, possible stale or missing prices, overlapping outcomes and no sector/index-relative benchmark. Factor rankings are exploratory and cannot establish a reliable trading edge. Avoid optimising against this holdout repeatedly.')
 
+
+
+# ---------------- Research-only combination, regime and portfolio validation ----------------
+def _sd_rules(train):
+    """Predeclared combinations. Quantiles estimated on training rows only."""
+    specs = {
+        'Accumulation + liquidity': [('Accumulation Score', 'high'), ('Dollar turnover', 'high')],
+        'VPA + 3M momentum': [('VPA Score', 'high'), ('Momentum 3M %', 'high')],
+        'Accumulation + price strength': [('Accumulation Score', 'high'), ('Above 50D %', 'high')],
+        'VPA + breakout proximity': [('VPA Score', 'high'), ('Distance to 20D high %', 'high')],
+        'Momentum + relative volume': [('Momentum 3M %', 'high'), ('Relative volume', 'high')],
+        'Accumulation + liquidity + trend': [('Accumulation Score', 'high'), ('Dollar turnover', 'high'), ('Above 50D %', 'high')],
+        'Low volatility + liquidity': [('Daily volatility %', 'low'), ('Dollar turnover', 'high')],
+        'VPA + accumulation': [('VPA Score', 'high'), ('Accumulation Score', 'high')],
+    }
+    rules = {}
+    for name, parts in specs.items():
+        thresholds = []
+        for column, direction in parts:
+            vals = pd.to_numeric(train[column], errors='coerce').dropna()
+            if len(vals) < 50: break
+            thresholds.append((column, direction, float(vals.quantile(.25 if direction == 'low' else .75))))
+        if len(thresholds) == len(parts): rules[name] = thresholds
+    return rules
+
+
+def _sd_select(frame, rule):
+    mask = pd.Series(True, index=frame.index)
+    for col, direction, cutoff in rule:
+        vals = pd.to_numeric(frame[col], errors='coerce')
+        mask &= vals.le(cutoff) if direction == 'low' else vals.ge(cutoff)
+    return frame.loc[mask]
+
+
+def _sd_portfolio(frame, horizon, capital, brokerage, slippage, min_purchase=500):
+    """Single-position, whole-share, cash-only fixed-horizon test; close-equity drawdown."""
+    if frame.empty: return {'Trades': 0, 'Final equity AUD': capital, 'Return %': 0., 'Win rate %': np.nan, 'Max closed-equity drawdown %': 0., 'Brokerage AUD': 0.}, pd.DataFrame()
+    f=frame.dropna(subset=['Entry date',f'Exit date {horizon}d',f'Return {horizon}d %','Entry']).sort_values(['Entry date','Ticker'])
+    cash=float(capital); free_at=pd.Timestamp.min; peak=cash; drawdown=0.; trades=[]
+    for r in f.itertuples(index=False, name=None):
+        row=dict(zip(f.columns,r)); entry_date=pd.Timestamp(row['Entry date']); exit_date=pd.Timestamp(row[f'Exit date {horizon}d'])
+        if entry_date <= free_at or exit_date <= entry_date: continue
+        entry=float(row['Entry']); gross=float(row[f'Return {horizon}d %'])
+        if not np.isfinite(entry) or entry<=0 or not np.isfinite(gross): continue
+        buy=entry*(1+slippage/100)
+        shares=int((cash-brokerage)//buy)
+        if shares<1 or shares*buy<min_purchase: continue
+        spent=shares*buy+brokerage
+        # Fixed-horizon return is based on the unadjusted entry-open to exit-close ratio.
+        exit_close=entry*(1+gross/100)
+        proceeds=shares*max(0.,exit_close)*(1-slippage/100)-brokerage
+        pnl=proceeds-spent
+        cash+=pnl
+        free_at=exit_date
+        peak=max(peak,cash)
+        drawdown=min(drawdown,(cash/peak-1)*100)
+        trades.append({'Ticker':row['Ticker'],'Entry date':entry_date.date().isoformat(),
+                       'Exit date':exit_date.date().isoformat(),'Shares':shares,
+                       'Net P/L AUD':round(pnl,2),'Equity after trade AUD':round(cash,2)})
+    win=sum(t['Net P/L AUD']>0 for t in trades)
+    return {'Trades':len(trades),'Final equity AUD':round(cash,2),
+            'Return %':round((cash/capital-1)*100,2),
+            'Win rate %':round(win/len(trades)*100,2) if trades else np.nan,
+            'Max closed-equity drawdown %':round(drawdown,2),
+            'Brokerage AUD':round(2*brokerage*len(trades),2)},pd.DataFrame(trades)
+
+
+def render_strategy_discovery():
+    st.header('🧭 Strategy Discovery & Validation')
+    st.write('Compare predefined indicator combinations, market-regime proxies, and a cash-constrained Stake-style portfolio using cached historical prices.')
+    st.warning('Exploratory research, NOT an untouched out-of-sample test. We have already inspected the later period in Historical Factor Discovery. The market-regime proxy is based on the cached shares, not the ASX index. No historical delisted-share coverage or spread/order-book replay.')
+    a,b,c=st.columns(3)
+    years=a.selectbox('Lookback (years)',[1,2,3,5,10],index=2,key='sd_years')
+    maximum=b.selectbox('Cached shares',[250,500,1000,0],index=2,format_func=lambda n:'All cached shares' if n==0 else str(n),key='sd_max')
+    spacing=c.selectbox('Sample every N sessions',[10,20,40,60],index=1,key='sd_step')
+    d,e,f=st.columns(3)
+    liquidity=d.number_input('Minimum average daily turnover AUD',min_value=0.,value=20000.,step=10000.,key='sd_liq')
+    horizon=e.selectbox('Holding period (sessions)',[5,10,20,60],index=2,key='sd_hold')
+    capital=f.number_input('Portfolio starting cash AUD',min_value=500.,value=1000.,step=500.,key='sd_capital')
+    brokerage=st.number_input('Stake brokerage per side AUD',min_value=0.,value=3.,step=1.,key='sd_brokerage')
+    slip=st.number_input('Slippage per side %',min_value=0.,value=.25,step=.05,key='sd_slip')
+    st.caption('Assumes whole shares, minimum $500 purchase, one position at a time, entry at next open, exit at the selected later close. No stop-loss or take-profit; no intratrade equity drawdown. Verify Stake pricing and rules for your account.')
+    settings=(years,maximum,spacing,liquidity)
+    if st.button('Run strategy discovery',type='primary',key='sd_run'):
+        with st.spinner('Computing historical factor observations…'):
+            data,count=_factor_discovery_observations(maximum,years,spacing,liquidity)
+        st.session_state['sd_cache']=(data,count,settings)
+    cached=st.session_state.get('sd_cache')
+    if cached is None: return
+    data,count,old_settings=cached
+    if old_settings!=settings: st.warning('These observations use the previous data settings. Run again to apply changes.')
+    ret=f'Return {horizon}d %'
+    if data.empty or ret not in data: st.warning('No usable cached price observations.'); return
+    data=data.dropna(subset=['Date','Entry',ret]).copy()
+    if len(data)<200: st.warning('Insufficient observations for meaningful comparisons.'); return
+    data['Date']=pd.to_datetime(data['Date'])
+    dates=np.sort(data['Date'].unique())
+    if len(dates)<45: st.warning('Too few dates for three separate time periods.'); return
+    first=pd.Timestamp(dates[int(len(dates)*.55)])
+    second=pd.Timestamp(dates[int(len(dates)*.78)])
+    embargo=pd.Timedelta(days=max(90,int(horizon*1.6)+10))
+    train=data[data['Date']<first-embargo].copy()
+    validation=data[(data['Date']>=first)&(data['Date']<second-embargo)].copy()
+    test=data[data['Date']>=second].copy()
+    if min(len(train),len(validation),len(test))<50: st.warning('Too few observations in one of the periods.'); return
+    fee_pct=(2*brokerage/500)*100+2*slip
+    for frame in (train,validation,test): frame['Net % approx']=frame[ret]-fee_pct
+    st.write(f'Cached shares: **{count:,}** · training: **{len(train):,}** · validation: **{len(validation):,}** · later evaluation: **{len(test):,}**')
+    st.caption(f'Training ends before {(first-embargo).date()}; validation starts {first.date()}; later evaluation starts {second.date()}. Each boundary includes an embargo of {embargo.days} calendar days.')
+    # Cross-sectional trend regime: majority of eligible sampled shares had positive 3M momentum.
+    trend=data.groupby('Date')['Momentum 3M %'].agg(lambda x: float((x>0).mean()) if x.notna().any() else np.nan)
+    for frame in (train,validation,test):
+        frame['Regime']=np.where(frame['Date'].map(trend)>=.5,'Broad positive momentum','Broad weak momentum')
+    st.subheader('Market-condition proxy')
+    regime_rows=[]
+    for name,frame in [('Training',train),('Validation',validation),('Later evaluation',test)]:
+        for regime,subset in frame.groupby('Regime'):
+            regime_rows.append({'Period':name,'Regime':regime,'Observations':len(subset),
+                                'Baseline avg net %':subset['Net % approx'].mean(),
+                                'Share of +10% hits %':subset[f'Hit +10% {horizon}d'].mean()*100})
+    st.dataframe(pd.DataFrame(regime_rows).round(2),use_container_width=True,hide_index=True)
+    rules=_sd_rules(train)
+    results=[]
+    for name,rule in rules.items():
+        a=_sd_select(train,rule); b=_sd_select(validation,rule); c=_sd_select(test,rule)
+        if len(a)<30 or len(b)<15: continue
+        results.append({'Combination':name,'Training signals':len(a),'Training avg net %':a['Net % approx'].mean(),
+                        'Validation signals':len(b),'Validation avg net %':b['Net % approx'].mean(),
+                        'Validation edge pp':b['Net % approx'].mean()-validation['Net % approx'].mean(),
+                        'Later signals':len(c),'Later avg net %':c['Net % approx'].mean() if len(c) else np.nan,
+                        'Later edge pp':c['Net % approx'].mean()-test['Net % approx'].mean() if len(c) else np.nan})
+    if not results: st.warning('No combinations had enough qualifying observations. Try more shares or lower the liquidity filter.'); return
+    table=pd.DataFrame(results).sort_values('Validation edge pp',ascending=False)
+    st.subheader('Factor combinations')
+    st.dataframe(table.round(2),use_container_width=True,hide_index=True)
+    st.caption('Thresholds come only from training; combinations were predefined. Ranking uses validation, not the later evaluation. However, repeated inspection of these data still creates selection bias.')
+    st.download_button('Download combination comparison CSV',table.to_csv(index=False).encode(),file_name='asx_strategy_discovery.csv',mime='text/csv',key='sd_export')
+    selected=st.selectbox('Inspect a combination',table['Combination'].tolist(),key='sd_choice')
+    rule=rules[selected]
+    st.write('**Training-derived rules:** '+', '.join(f'{col} {"≤" if direction=="low" else "≥"} {cutoff:,.2f}' for col,direction,cutoff in rule))
+    st.subheader('Cash-constrained portfolio replay')
+    st.caption('Only later-evaluation signals are traded. All cash is allocated to at most one share. Trades do not overlap. Same-day competing signals are resolved alphabetically, not by future returns. Results include estimated entry/exit slippage and brokerage.')
+    replay=_sd_select(test,rule)
+    summary,trades=_sd_portfolio(replay,horizon,capital,brokerage,slip)
+    cols=st.columns(4)
+    cols[0].metric('Trades',summary['Trades'])
+    cols[1].metric('Final cash/equity',f'${summary["Final equity AUD"]:,.2f}')
+    cols[2].metric('Portfolio return',f'{summary["Return %"]:+.2f}%')
+    cols[3].metric('Closed-trade drawdown',f'{summary["Max closed-equity drawdown %"]:.2f}%')
+    if not trades.empty:
+        st.dataframe(trades,use_container_width=True,hide_index=True)
+        st.download_button('Download portfolio trades CSV',trades.to_csv(index=False).encode(),file_name='asx_discovery_portfolio_trades.csv',mime='text/csv',key='sd_trades')
+    else: st.info('No trades met the minimum purchase and available-cash rules in this period.')
+    st.warning('Portfolio replay is approximate: no spreads, market depth, order fill failures, intraday stop execution, taxes or mark-to-market drawdown. Corporate-action-adjusted historical prices can distort real fills. Later evaluation is NOT pristine because earlier factor results were already viewed. A prospective paper-trading period is needed before relying on a strategy.')
+
 with st.sidebar:
-    page=st.radio("Page",["Today’s Opportunities","Consistent Gains","Breakout Opportunities","Strategy Backtest Comparison","Historical Factor Discovery","Single-Share Analysis","Automatic Share Scanner","Early-Mover Tracker","VPA Scanner","Prediction Lab","Phase 4 Backtest","Historical Signal Explorer","Sector Performance","Sector Prediction Accuracy","Lower-Risk Investing","Value Investing","Momentum Trading","High-Growth Shares","Long-Term Investing","Portfolio Planner"])
+    page=st.radio("Page",["Today’s Opportunities","Consistent Gains","Breakout Opportunities","Strategy Backtest Comparison","Historical Factor Discovery","Strategy Discovery & Validation","Single-Share Analysis","Automatic Share Scanner","Early-Mover Tracker","VPA Scanner","Prediction Lab","Phase 4 Backtest","Historical Signal Explorer","Sector Performance","Sector Prediction Accuracy","Lower-Risk Investing","Value Investing","Momentum Trading","High-Growth Shares","Long-Term Investing","Portfolio Planner"])
     st.divider()
     ticker_text=st.text_area("ASX tickers (commas or new lines)",", ".join(MASTER_TICKERS),height=160,
         help="Defaults to the bundled ASX company list. Edit or paste your own tickers if needed.")
@@ -3235,6 +3391,8 @@ elif page=="Strategy Backtest Comparison":
     render_strategy_comparison()
 elif page=="Historical Factor Discovery":
     render_factor_discovery()
+elif page=="Strategy Discovery & Validation":
+    render_strategy_discovery()
 
 elif page=="Phase 4 Backtest":
     st.header("🧪 Phase 4 — Historical Backtest & Diagnostics")
